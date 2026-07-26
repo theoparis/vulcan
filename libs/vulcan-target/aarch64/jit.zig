@@ -14,11 +14,21 @@ pub const Provider = platform.Provider;
 /// A W^X executable buffer that synchronizes the AArch64 instruction cache.
 pub const CodeBuffer = platform.Buffer(syncICache);
 
-/// Synchronize the instruction stream with freshly written code: clean the D-cache
-/// and invalidate the I-cache to the point of unification (line sizes from `ctr_el0`).
+/// Synchronize the instruction stream with freshly written code. Darwin does
+/// not permit userspace to read `ctr_el0` on current macOS, so use libSystem's
+/// cache-maintenance entry point there. Other AArch64 targets use explicit
+/// cache-line maintenance with line sizes from `ctr_el0`.
 /// A no-op off aarch64 (the code could not run there anyway).
 fn syncICache(memory: []const u8) void {
     if (builtin.cpu.arch != .aarch64) return;
+    if (builtin.os.tag == .macos or builtin.os.tag == .ios) {
+        const apple = struct {
+            extern "c" fn sys_icache_invalidate(address: ?*const anyopaque, size: usize) void;
+        };
+        apple.sys_icache_invalidate(memory.ptr, memory.len);
+        return;
+    }
+
     const ctr = asm volatile ("mrs %[r], ctr_el0"
         : [r] "=r" (-> usize),
     );
