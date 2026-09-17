@@ -276,6 +276,16 @@ pub const Interval = struct {
     // both from its parent, because a split cuts a lifetime and never changes a value's width.
     regs: u16 = 1,
     reg_align: u16 = 1,
+    /// True for an interval `splitInterval` created. The value has an EARLIER piece, so it already
+    /// has a location the store can read at the split point. False for an interval `buildIntervals`
+    /// made, which is the value's first piece and holds no location before its own start.
+    split_child: bool = false,
+    /// For a SPILLED interval whose value must reach memory BEFORE the interval starts: the position
+    /// the store is emitted at, in place of the interval's own start. A reload-at-use split leaves a
+    /// register holding the value for exactly the position of a must-have use, and a fixed clobber
+    /// destroys that register the instant the use is over, so the store goes IN FRONT of the
+    /// clobbering instruction, not behind it. Null for every other interval.
+    store_at: ?u32 = null,
 
     /// The interval's first live position. Programmer error to call on an empty interval.
     pub fn start(self: *const Interval) u32 {
@@ -1424,6 +1434,42 @@ fn valueLocAt(all: []const *Interval, v: Value, pos: u32) ?Location {
     return null;
 }
 
+/// True iff the half-open range `[from, to)` meets any live range of `it`, or the EARLY-STORE prefix
+/// `it` occupies. An interval with `store_at` writes its slot at that position, so the slot carries
+/// the value from there, ahead of the interval's first range.
+///
+/// The range must not be empty. Both callers pass the early-store prefix `[store_at, start())` of
+/// some interval, and `spillCurrent` always sets `store_at` strictly before the start of the
+/// interval it sets it on. The assert names that invariant instead of returning a quiet `false` for
+/// a range that cannot arise. `verifyIntervals` reports a broken `store_at` as its own violation, so
+/// a bad allocation is named there rather than swallowed here.
+fn rangeMeetsInterval(from: u32, to: u32, it: *const Interval) bool {
+    std.debug.assert(from < to);
+    for (it.ranges) |r| {
+        if (from < r.to and r.from < to) return true;
+    }
+    if (it.store_at) |p| {
+        if (from < it.start() and p < to) return true;
+    }
+    return false;
+}
+
+/// True iff two intervals hold their slot at the same time. This is `nextIntersection` plus the
+/// early-store prefix of either side. A reload-at-use split writes the slot one position in front of
+/// the interval, so the slot is busy from there. Reading the ranges alone would let the coalescer
+/// hand that slot to a value whose own range ends exactly at the store position, and the early store
+/// would then destroy it.
+fn slotIntervalsInterfere(a: *const Interval, b: *const Interval) bool {
+    if (a.nextIntersection(b) != null) return true;
+    if (a.store_at) |pa| {
+        if (rangeMeetsInterval(pa, a.start(), b)) return true;
+    }
+    if (b.store_at) |pb| {
+        if (rangeMeetsInterval(pb, b.start(), a)) return true;
+    }
+    return false;
+}
+
 /// True iff the two spill-slot groups (all class-`class` intervals whose slot's representative is
 /// `rep_a`, versus `rep_b`) contain a pair of intervals whose live ranges overlap. Such a pair
 /// cannot share a slot: they would hold two different live values at once. Reads the pre-rewrite
@@ -1443,7 +1489,7 @@ fn slotGroupsInterfere(all: []const *Interval, parent: []u32, class_off: []const
                 .reg => continue,
             };
             if (ufFind(parent, class_off[class] + sb) != rep_b) continue;
-            if (ia.nextIntersection(ib) != null) return true;
+            if (slotIntervalsInterfere(ia, ib)) return true;
         }
     }
     return false;
@@ -1740,6 +1786,14 @@ pub fn allocate(allocator: std.mem.Allocator, func: *const Function, desc: *cons
     defer allocator.free(slots);
     @memset(slots, 0);
 
+    // The block-entry positions, computed once for the whole scan. `spillCurrent` reads them to keep
+    // a reload-at-use split inside one block, so resolution never emits an edge move for the same
+    // location change the split already stores. This copy is local to the scan. `coalesceSpillSlots`
+    // and `buildAllocation` each compute their own, because they run after the scan frees this one.
+    const bounds = try computeBlockBounds(allocator, func);
+    defer allocator.free(bounds.from);
+    defer allocator.free(bounds.to);
+
     // The worklist (`unhandled`) is a priority queue. It holds value intervals sorted ascending
     // by start, popped from the front, with split children re-inserted in sorted position. Fixed
     // intervals never enter it. A CALL-CLOBBER fixed interval (`value == null`) is seeded into
@@ -1779,8 +1833,13 @@ pub fn allocate(allocator: std.mem.Allocator, func: *const Function, desc: *cons
     // The scan is a worklist loop. Every split child starts strictly after the interval it came
     // from, so the total interval count is bounded by (values x positions). The guard asserts that
     // bound, to catch a splitting bug that would otherwise loop forever.
+    //
+    // The factor of two covers the reload-at-use split. That split pops an interval and puts the SAME
+    // interval back, so one interval can cost two iterations. It cannot cost more than two: the
+    // requeued interval is one position wide, and precondition 2 of `canReloadAtUse` refuses a second
+    // reload-at-use split on it.
     const max_pos = maxEndPosition(intervals);
-    const iter_bound: usize = intervals.len + intervals.len * (@as(usize, max_pos) + 1);
+    const iter_bound: usize = 2 * (intervals.len + intervals.len * (@as(usize, max_pos) + 1));
     var iters: usize = 0;
     while (unhandled.items.len > 0) {
         iters += 1;
@@ -1832,7 +1891,7 @@ pub fn allocate(allocator: std.mem.Allocator, func: *const Function, desc: *cons
             current.location = .{ .reg = reg };
             try active.append(allocator, current);
         } else {
-            try allocateBlockedReg(allocator, current, &active, &inactive, &unhandled, &children, slots, desc, limit);
+            try allocateBlockedReg(allocator, current, &active, &inactive, &unhandled, &children, slots, desc, limit, bounds.from);
         }
     }
 
@@ -2025,6 +2084,9 @@ fn splitInterval(allocator: std.mem.Allocator, parent: *Interval, pos: u32, chil
         // registers under the same alignment as its parent.
         .regs = parent.regs,
         .reg_align = parent.reg_align,
+        // The head keeps everything before `pos`, so this child always has an earlier piece. The
+        // reload-at-use split in `spillCurrent` reads this to know a location exists to store from.
+        .split_child = true,
     };
     try children.append(allocator, child);
 
@@ -2034,6 +2096,49 @@ fn splitInterval(allocator: std.mem.Allocator, parent: *Interval, pos: u32, chil
     allocator.free(parent.uses);
     parent.uses = hu;
     return child;
+}
+
+/// Whether the RELOAD-AT-USE split is legal for `current`, whose first `must_have_register` use `u`
+/// sits at its own start. The split keeps `[u, u + 1)` in a register for the use alone and puts the
+/// remainder in a slot that is written at `u`, in front of the clobber. Four things must hold, and
+/// each one guards a different way the result would be wrong:
+///
+///  1. `current` is a split child. The value then has an EARLIER piece, so it already occupies a
+///     location at `u` that the early store can read. Without one the value is DEFINED at `u` and
+///     nothing is in memory yet to store.
+///  2. `current.end() > u + 1`. There must be room for both halves. An interval that is already one
+///     position wide and still cannot hold a register is the genuinely unsatisfiable case.
+///  3. No `must_have_register` use sits at `u + 1`, which is where the remainder starts. The
+///     remainder must not need a register at its own start, or the move that gives it one lands
+///     behind the clobber and reads the destroyed register.
+///  4. `u + 1` is not a block-entry position. The transition must stay inside one block. A
+///     block-entry transition is an edge move resolution emits, and the value would then be stored
+///     twice.
+///
+/// Precondition 4 tests `u + 1`, but the position resolution classifies is the START of the
+/// remainder. The two are the same position unless `current` has a hole immediately after `u`. In
+/// the hole shape the remainder starts at the next range, and every range after an interval's first
+/// range starts at a block-entry row. Resolution then DOES emit an edge move for the same transition
+/// the early store made, and the value goes to memory twice. That result is still correct, for a
+/// reason liveness gives. The hole says the value is not live-out of the block that holds `u`. The
+/// block the remainder starts at has the value live-in, so the value is live-out of every
+/// predecessor of that block. If that block were reachable from the block that holds `u`, then the
+/// value would be live-out of the block that holds `u` too, and the liveness passes would have
+/// filled the hole. So the two stores sit on paths that never meet, and the store at `u` is dead but
+/// harmless. `coalesceSpillSlots` holds the slot over the whole prefix `[store_at, start())`, so no
+/// other value can take the slot inside the gap.
+fn canReloadAtUse(current: *const Interval, u: u32, block_from: []const u32) bool {
+    if (!current.split_child) return false;
+    if (current.end() <= u + 1) return false;
+    // The uses are ascending, so a must-have use at `u + 1` IS the first must-have use after `u`.
+    for (current.uses) |use| {
+        if (use.pos != u + 1) continue;
+        if (use.kind == .must_have_register) return false;
+    }
+    for (block_from) |f| {
+        if (f == u + 1) return false;
+    }
+    return true;
 }
 
 /// Spill `current`. It is the cheapest interval to move to memory: its own first use is further
@@ -2057,17 +2162,57 @@ fn spillCurrent(
     children: *std.ArrayList(*Interval),
     slots: []u32,
     class_idx: u16,
+    block_from: []const u32,
 ) AllocateError!void {
     if (firstMustHaveUse(current)) |u| {
         // A must_have use AT `current.start()` means `current` needs a register the instant it
         // becomes live. But it is the interval being spilled BECAUSE nothing here can be freed for
-        // it. A same-position group, for example a loop header with more live params than the
-        // class has registers, can reach this exact split child through repeated re-eviction,
-        // where the only remaining must-have use coincides with the child's own start. That is
-        // more simultaneous must-have demand than the class can ever satisfy. It is the SAME "too
-        // many live params" limit the old allocator (aarch64 isel.zig `allocate`) rejects for this
-        // shape. So this bails to match, rather than asserting a programmer error.
-        if (u <= current.start()) return error.Unsupported;
+        // it. The RELOAD-AT-USE split below serves that demand where it can: the value stays in
+        // memory across the clobber and comes back to a register for the one position that reads
+        // it. Where a precondition of that split fails, this is more simultaneous must-have demand
+        // than the class can ever satisfy. It is the SAME "too many live params" limit the old
+        // allocator (aarch64 isel.zig `allocate`) rejects for this shape. So this bails to match,
+        // rather than asserting a programmer error.
+        if (u <= current.start()) {
+            // `u` is never BEFORE the start. `firstMustHaveUse` reads this interval's own uses, and
+            // `splitInterval` gives a child only the uses at or past the child's start. The branch
+            // below needs that equality, because `splitInterval(current, u + 1)` asserts
+            // `u + 1 > current.start()`. The `<=` test above is defensive, so name the real shape.
+            std.debug.assert(u == current.start());
+            // `current` goes back to the worklist for a REGISTER, not for a slot, so it must hold no
+            // early store position. Only a spilled interval has one, and the branch below is the only
+            // writer of the field. A stale `store_at` would make `buildAllocation` put the reload of
+            // the requeued head at an earlier position, into a register the clobber destroys.
+            std.debug.assert(current.store_at == null);
+            if (!canReloadAtUse(current, u, block_from)) return error.Unsupported;
+            // Cut `current` down to `[u, u + 1)`, EXACTLY the use, and give everything past the use
+            // to `rest`. `rest` carries the slot and stores at `u`, in front of the instruction that
+            // clobbers the register, because a store behind the clobber would read a dead register.
+            const rest = try splitInterval(allocator, current, u + 1, children);
+            rest.store_at = u;
+            // One level deep, and no deeper. The bound is that `rest` has no must-have use at its
+            // own start, in BOTH shapes `rest` can take. When `current` has no hole after `u`, `rest`
+            // starts at `u + 1`, and precondition 3 rejected a must-have use there. When `current`
+            // has a hole after `u`, `rest` starts at the next range, and every range after an
+            // interval's first range starts at a block-entry row. `buildIntervals` records a use only
+            // at an instruction position, never at a block-entry row, so `rest` then has NO use at
+            // its own start. Precondition 3 alone does not prove this. It is vacuous in the hole
+            // shape. In both shapes this call takes the ordinary branch and never recurses again.
+            //
+            // The assert turns that two-shape argument into a checked fact. The uses are ascending,
+            // so the first one is the only one that can sit at the start. If a later change records
+            // a use at a block-entry row, the hole shape stops holding and this fires here, instead
+            // of recursing without a bound.
+            std.debug.assert(rest.uses.len == 0 or rest.uses[0].pos > rest.start() or rest.uses[0].kind != .must_have_register);
+            try spillCurrent(allocator, rest, unhandled, children, slots, class_idx, block_from);
+            // Re-queue `current`. It no longer covers `u + 1`, so `fixedClobberConflict` reports no
+            // conflict with the call clobber and `tryAllocateFreeReg` serves it from a caller-saved
+            // register on the next pop. Clearing the location drops any register the caller handed
+            // it before it decided to spill.
+            current.location = null;
+            try insertSorted(allocator, unhandled, current);
+            return;
+        }
         const tail = try splitInterval(allocator, current, u, children);
         current.location = .{ .slot = slots[class_idx] };
         slots[class_idx] += 1;
@@ -2098,6 +2243,7 @@ fn allocateBlockedReg(
     slots: []u32,
     desc: *const RegDescription,
     limit: usize,
+    block_from: []const u32,
 ) AllocateError!void {
     const class_idx = current.class;
     const class = desc.classes[class_idx];
@@ -2193,26 +2339,57 @@ fn allocateBlockedReg(
     // The candidate is a BASE register whose whole span is placeable and evictable, and the span is
     // wanted back as soon as its earliest-wanted register. For the one-register default this is the
     // old per-register loop in the same order, so the pick is byte-identical.
+    //
+    // A hard block is folded into `next_use` too, so a register a fixed interval clobbers AT `p`
+    // looks exactly like one an ordinary occupant wants back at `p`. That tie is not neutral. A
+    // register blocked at `p` cannot carry `current` past the block, and `current` cannot be split
+    // before it either, since `splitInterval` needs `pos > start`. So taking it forces `current`
+    // into a slot, and a MUST_HAVE use at `p` then has no register at all. That is the shape a call
+    // argument which is ALSO live across the call makes: every caller-saved register is blocked at
+    // the call, every callee-saved one is held by another argument wanted at the same call, and the
+    // whole pool ties at `p`. Rank a blocked register last, so a callee-saved register that can
+    // carry `current` across the call wins the tie. A fixed conflict is never reported before
+    // `current` starts, so `blocked` holds only where the block falls exactly at `p`, and a
+    // contested position with no clobber on it picks the same register as before.
+    //
+    // A call clobber is not the only source of a block at `p`. An entry-parameter pin gives one too,
+    // through `current.nextIntersection(it)`, at `p == 0`. The tie-break reorders that case as well,
+    // and the pick there really can change. Where SOME candidate wants its register back later than
+    // `p`, both rules take that candidate and the pin loses either way. But where the WHOLE pool
+    // ties at `p`, which is what more entry parameters than registers makes, the old rule broke the
+    // tie by register index and could take the pinned register, and the new rule takes an unpinned
+    // one instead. Both picks are legal, because the pin blocks the register for both rules, and
+    // `verifyIntervals` checks the placement that comes out of either.
     var chosen: ?u16 = null;
     var best: u32 = 0;
+    var chosen_blocked = true;
     for (0..limit) |b| {
         if (!spanPlaceable(&is_candidate, &evictable, limit, b, current.regs, current.reg_align)) continue;
         const nu = spanMin(&next_use, b, current.regs);
-        if (chosen == null or nu > best) {
+        const blocked = spanMin(&block_pos, b, current.regs) <= p;
+        const better = if (chosen == null) true else if (blocked != chosen_blocked) chosen_blocked else nu > best;
+        if (better) {
             best = nu;
             chosen = @intCast(b);
+            chosen_blocked = blocked;
         }
         // Same bound as in `tryAllocateFreeReg`: `infinity` is the furthest a next use can be, and
         // the comparison above is strict, so the register already chosen is the one the whole sweep
-        // would have chosen.
-        if (best == infinity) break;
+        // would have chosen. The tie-break cannot beat it either: a block folds its position into
+        // `next_use`, that position is `p`, and `p` is a real position. So a blocked register never
+        // reaches `infinity`. The assert makes that a checked fact. A `!chosen_blocked` test in the
+        // condition would read as a test and never fire.
+        if (best == infinity) {
+            std.debug.assert(!chosen_blocked);
+            break;
+        }
     }
 
     // No register is evictable: every candidate is held by a same-start same-class interval (e.g. more
     // params than the pool). None can be split at `p`, so spill `current` instead. It belongs to that
     // same-start group, so spilling it is valid and makes progress.
     const reg = chosen orelse {
-        try spillCurrent(allocator, current, unhandled, children, slots, class_idx);
+        try spillCurrent(allocator, current, unhandled, children, slots, class_idx, block_from);
         return;
     };
 
@@ -2222,7 +2399,7 @@ fn allocateBlockedReg(
     // existed.
     const current_first_use = current.firstUseAfter(p);
     if (current_first_use == null or current_first_use.? > best) {
-        try spillCurrent(allocator, current, unhandled, children, slots, class_idx);
+        try spillCurrent(allocator, current, unhandled, children, slots, class_idx, block_from);
         return;
     }
 
@@ -2270,7 +2447,7 @@ fn allocateBlockedReg(
         // at its start, a demand no slot can satisfy. A target whose uses may read from a slot
         // (`should_have_register`) spills cleanly.
         if (bp <= p) {
-            try spillCurrent(allocator, current, unhandled, children, slots, class_idx);
+            try spillCurrent(allocator, current, unhandled, children, slots, class_idx, block_from);
             return;
         }
         const tail = try splitInterval(allocator, current, bp, children);
@@ -2333,6 +2510,13 @@ fn actionAtLessThan(_: void, a: Action, b: Action) bool {
 /// reads, and a reload reads a slot no other action writes. So every register cycle is reg-to-reg
 /// and every slot-to-slot move is independent, and the scratch routing is never nested inside a
 /// held cycle.
+///
+/// A reload-at-use split adds a same-position pattern this paragraph must cover: ONE source feeds
+/// BOTH a reload and an early store at the position of the use. `buildAllocation` gives the store
+/// the location the value holds just before that position, which is the same location the reload
+/// reads. Two transfers out of one source are not a hazard for a parallel move. The source is read,
+/// never written, so neither sentence above breaks, and `orderMoves` is free to emit the pair in
+/// either order.
 fn orderIntraActions(allocator: std.mem.Allocator, sorted: []const Action, desc: *const RegDescription) Error![]Action {
     var out: std.ArrayList(Action) = .empty;
     errdefer out.deinit(allocator);
@@ -2431,10 +2615,15 @@ fn buildAllocation(allocator: std.mem.Allocator, func: *const Function, interval
         std.mem.sort(*const Interval, list.items, {}, intervalStartLessThanConst);
         var segs: std.ArrayList(Segment) = .empty;
         errdefer segs.deinit(allocator);
+        // The interval each segment came from, kept beside the segment list. A `store_at` lives on
+        // the interval, not on the segment, and the transition loop below must read it.
+        var seg_owner: std.ArrayList(*const Interval) = .empty;
+        defer seg_owner.deinit(allocator);
         for (list.items) |iv| {
             const loc = iv.location.?;
             if (segs.items.len > 0 and locEql(segs.items[segs.items.len - 1].loc, loc)) continue;
             try segs.append(allocator, .{ .from = iv.start(), .loc = loc });
+            try seg_owner.append(allocator, iv);
         }
         // Every consecutive segment pair is a location change the emitter must realize. An
         // INTRA-block change, where both sides fall in one block, becomes an `Action` at the later
@@ -2445,7 +2634,21 @@ fn buildAllocation(allocator: std.mem.Allocator, func: *const Function, interval
         while (i + 1 < segs.items.len) : (i += 1) {
             const a = segs.items[i];
             const b = segs.items[i + 1];
-            const at = b.from;
+            var at = b.from;
+            var src = a.loc;
+            // An interval the reload-at-use split made carries `store_at`. Its value must reach the
+            // slot BEFORE the interval starts, because the instruction at the earlier position
+            // clobbers the register the value sits in. So the action moves in front of that
+            // instruction, and it reads what the value occupies just before that position, not the
+            // register the clobber is about to destroy.
+            if (seg_owner.items[i + 1].store_at) |store_pos| {
+                at = store_pos;
+                src = segmentLocBefore(segs.items[0 .. i + 1], store_pos);
+                // The value is already in that slot, so the store would copy a slot onto itself.
+                // Spill-slot coalescing puts every piece of one value on one slot, which makes this
+                // the common outcome.
+                if (locEql(src, b.loc)) continue;
+            }
             // A transition is cross-block, resolved on the edge, ONLY when the later segment begins
             // EXACTLY on a block-entry position. Any other transition happens mid-block and is an
             // intra-block action, even when the earlier segment began in an earlier block. A value
@@ -2459,7 +2662,7 @@ fn buildAllocation(allocator: std.mem.Allocator, func: *const Function, interval
                 result.needs_resolution = true;
                 continue;
             }
-            try actions.append(allocator, .{ .at = at, .kind = actionKind(a.loc, b.loc), .class = class, .src = a.loc, .dst = b.loc, .value = e.key_ptr.* });
+            try actions.append(allocator, .{ .at = at, .kind = actionKind(src, b.loc), .class = class, .src = src, .dst = b.loc, .value = e.key_ptr.* });
         }
 
         const owned = try segs.toOwnedSlice(allocator);
@@ -2541,6 +2744,25 @@ fn buildAllocation(allocator: std.mem.Allocator, func: *const Function, interval
 // loudly on a wiring mistake. `allocate` never splits edges itself, since that
 // would invalidate the already-built positions.
 // ===========================================================================
+
+/// The location the value occupies JUST BEFORE `pos`: the location of the last segment that starts
+/// strictly before `pos`. `segs` is ascending by `from` and holds at least one such segment.
+///
+/// This is the source an early store reads. It is NOT the location of the segment that starts at
+/// `pos`. A store and a reload at one position run as a PARALLEL move, so both must read the same
+/// source, or the ordering can run the store first and read a register the reload has not filled
+/// yet. Where two pieces beside each other share a location, their segments merge into one, and that
+/// one segment starts before `pos` and already names the correct source. So this walk is correct for
+/// both shapes.
+fn segmentLocBefore(segs: []const Segment, pos: u32) Location {
+    std.debug.assert(segs.len > 0);
+    std.debug.assert(segs[0].from < pos);
+    var loc = segs[0].loc;
+    for (segs) |s| {
+        if (s.from < pos) loc = s.loc;
+    }
+    return loc;
+}
 
 /// The location a value occupies at position `pos`, read from its ascending segment list: the
 /// location of the last segment that starts at or before `pos`. Programmer error if `pos` precedes
@@ -2990,6 +3212,14 @@ fn assertNoCriticalEdges(allocator: std.mem.Allocator, func: *const Function) Er
 //   3. ASSIGNMENT: every value interval with a use was placed somewhere.
 //   4. SPAN LEGALITY: a placed interval's base register meets the alignment its
 //      width demands, and its span fits the register-index space.
+//   5. EARLY STORE: an interval with `store_at` reads a location that still
+//      holds the value at that position, and owns its slot over the whole
+//      prefix from the store to its own start. A reload-at-use split is the
+//      only maker of such an interval, and it is the first thing that makes a
+//      slot busy OUTSIDE the ranges of the interval that owns it. Slot
+//      exclusivity was true by construction before spill-slot coalescing, and
+//      the coalescer polices itself, so this is where the new obligation is
+//      answered rather than argued.
 //
 // The two legitimate same-span overlaps, a value interval and its OWN
 // entry-parameter fixed interval at entry, and a coalesced copy pair, are
@@ -3001,7 +3231,7 @@ fn assertNoCriticalEdges(allocator: std.mem.Allocator, func: *const Function) Er
 /// slice passed to the verifier, and `b == a` for the single-interval checks. `pos` is the program
 /// position the violation manifests at.
 pub const Violation = struct {
-    kind: enum { reg_overlap, must_have_spilled, unassigned, misaligned_span },
+    kind: enum { reg_overlap, must_have_spilled, unassigned, misaligned_span, store_src_dead, store_slot_busy },
     a: usize,
     b: usize,
     pos: u32,
@@ -3061,6 +3291,30 @@ fn valueInRegAt(intervals: []const Interval, v: Value, pos: u32) bool {
         switch (loc) {
             .reg => if (it.covers(pos)) return true,
             .slot => {},
+        }
+    }
+    return false;
+}
+
+/// True iff some OTHER piece of value `v` still holds the value at `pos`: a piece with a location,
+/// starting strictly before `pos`, that stays live up to it. `self` indexes the piece that asks, so
+/// a piece never answers about itself.
+///
+/// "Up to `pos`" means a range `[from, to)` with `from < pos` and `to >= pos`. A range that ends
+/// EXACTLY at `pos` counts. Ranges are half-open, so such a range is the value's last piece before
+/// `pos`, and a parallel move at `pos` reads the state the instruction at `pos` has not touched yet,
+/// which that piece still owns. This is the liveness an early store needs. The store reads the piece
+/// just BEFORE the store position, never the piece that starts there, because the piece that starts
+/// there is filled by a reload in the same parallel move.
+fn valueHeldBefore(intervals: []const Interval, v: Value, pos: u32, self: usize) bool {
+    for (intervals, 0..) |*it, i| {
+        if (i == self) continue;
+        if (it.fixed_reg != null) continue;
+        const iv = it.value orelse continue;
+        if (iv != v) continue;
+        if (it.location == null) continue;
+        for (it.ranges) |r| {
+            if (r.from < pos and r.to >= pos) return true;
         }
     }
     return false;
@@ -3135,5 +3389,247 @@ pub fn verifyIntervals(allocator: std.mem.Allocator, intervals: []const Interval
         try violations.append(allocator, .{ .kind = .misaligned_span, .a = i, .b = i, .pos = ia.start() });
     }
 
+    // CHECK 5: the early store. An interval with `store_at` writes its slot IN FRONT of its own
+    // first range. No other interval touches a location outside its own ranges, so this interval
+    // carries two obligations that belong to it alone.
+    //
+    // SOURCE. The store position must lie before the interval, and the value must still be in a
+    // located piece there. That piece is what the store reads. A dead source means the store writes
+    // whatever the register or slot holds now, which is another value's bits.
+    //
+    // SLOT. The interval must own its slot over the WHOLE prefix `[store_at, start())`, not only
+    // over its ranges. The store makes the slot busy from `store_at`, so a value that is still live
+    // in that slot anywhere in the prefix loses its bits. `coalesceSpillSlots` is the only pass that
+    // puts two values on one slot and it tests the same prefix, so this re-answers the question at
+    // the output instead of trusting the pass. An interval with `store_at` and no slot at all cannot
+    // meet the obligation either, and is reported the same way.
+    for (intervals, 0..) |*ia, i| {
+        const p = ia.store_at orelse continue;
+        const va = ia.value orelse continue;
+        if (p >= ia.start() or !valueHeldBefore(intervals, va, p, i)) {
+            try violations.append(allocator, .{ .kind = .store_src_dead, .a = i, .b = i, .pos = p });
+            continue;
+        }
+        // An early store needs a slot to write. A register location, or no location, gives it no
+        // target at all, so the slot obligation fails in the plainest way.
+        const slot_or_none: ?u32 = if (ia.location) |loc| switch (loc) {
+            .slot => |s| s,
+            .reg => null,
+        } else null;
+        const sa = slot_or_none orelse {
+            try violations.append(allocator, .{ .kind = .store_slot_busy, .a = i, .b = i, .pos = p });
+            continue;
+        };
+        for (intervals, 0..) |*ib, j| {
+            if (j == i) continue;
+            if (ib.class != ia.class) continue;
+            const sb = switch (ib.location orelse continue) {
+                .slot => |s| s,
+                .reg => continue,
+            };
+            if (sb != sa) continue;
+            if (!rangeMeetsInterval(p, ia.start(), ib)) continue;
+            try violations.append(allocator, .{ .kind = .store_slot_busy, .a = i, .b = j, .pos = p });
+        }
+    }
+
     return violations.toOwnedSlice(allocator);
+}
+
+// ===========================================================================
+// In-module tests. These read functions this module keeps private, which the
+// tests in `wimmer_test.zig` cannot reach. The `vulcan-target` module test in
+// build.zig runs them.
+// ===========================================================================
+
+// The rule the whole RELOAD-AT-USE split rests on: a fixed call-clobber interval takes a register
+// away from a value interval ONLY where that value interval covers BOTH the clobber position `c`
+// and `c + 1`. A value that is dead the instant the call is over therefore keeps its register
+// through the call. The call reads the register as an argument, then writes it, and nothing later
+// wants the old contents.
+//
+// `spillCurrent` builds exactly such a value. It cuts the spilled interval down to `[u, u + 1)`,
+// one position wide, where `u` is the position of the call. The head is legal in a CALLER-SAVED
+// register only because of the rule above. If the rule became "covers `c`", that head would
+// conflict with every caller-saved register, the split would have nowhere to put the use, and the
+// allocator would refuse the function again. This test goes red on such a change. A comment cannot,
+// because a comment survives the change it describes.
+test "fixedClobberConflict: a one-position interval at a call keeps its register" {
+    const c: u32 = 7;
+    var no_uses = [_]UsePos{};
+
+    // The call clobber: one fixed interval per clobbered register, live over the call row alone.
+    var clobber_ranges = [_]Range{.{ .from = c, .to = c + 1 }};
+    const clobber: Interval = .{
+        .value = null,
+        .class = 0,
+        .fixed_reg = 0,
+        .ranges = &clobber_ranges,
+        .uses = &no_uses,
+    };
+
+    // THE LOAD-BEARING CASE. The reload-at-use head is live for the call row and nothing more, so
+    // the clobber does not conflict with it and every caller-saved register stays open to it.
+    var head_ranges = [_]Range{.{ .from = c, .to = c + 1 }};
+    const head: Interval = .{
+        .value = @enumFromInt(0),
+        .class = 0,
+        .fixed_reg = null,
+        .ranges = &head_ranges,
+        .uses = &no_uses,
+    };
+    try std.testing.expectEqual(@as(?u32, null), fixedClobberConflict(&head, &clobber));
+
+    // A value that is an argument AND is read after the call covers both rows, so it conflicts. This
+    // is the case the head was split OUT of, and it must keep conflicting.
+    var across_ranges = [_]Range{.{ .from = c, .to = c + 2 }};
+    const across: Interval = .{
+        .value = @enumFromInt(1),
+        .class = 0,
+        .fixed_reg = null,
+        .ranges = &across_ranges,
+        .uses = &no_uses,
+    };
+    try std.testing.expectEqual(@as(?u32, c), fixedClobberConflict(&across, &clobber));
+
+    // A value the call DEFINES starts after the clobber row, so it covers `c + 1` but not `c`.
+    var tail_ranges = [_]Range{.{ .from = c + 1, .to = c + 3 }};
+    const tail: Interval = .{
+        .value = @enumFromInt(2),
+        .class = 0,
+        .fixed_reg = null,
+        .ranges = &tail_ranges,
+        .uses = &no_uses,
+    };
+    try std.testing.expectEqual(@as(?u32, null), fixedClobberConflict(&tail, &clobber));
+
+    // A value that dies AT the call covers `c` but not `c + 1`, which is the same shape as the head
+    // with a longer lead-in. It keeps its register too.
+    var dying_ranges = [_]Range{.{ .from = c - 2, .to = c + 1 }};
+    const dying: Interval = .{
+        .value = @enumFromInt(3),
+        .class = 0,
+        .fixed_reg = null,
+        .ranges = &dying_ranges,
+        .uses = &no_uses,
+    };
+    try std.testing.expectEqual(@as(?u32, null), fixedClobberConflict(&dying, &clobber));
+
+    // A value with a HOLE over the call row covers neither row, so it is free of the clobber even
+    // though it is live on both sides of it.
+    var holed_ranges = [_]Range{ .{ .from = c - 2, .to = c }, .{ .from = c + 1, .to = c + 3 } };
+    const holed: Interval = .{
+        .value = @enumFromInt(4),
+        .class = 0,
+        .fixed_reg = null,
+        .ranges = &holed_ranges,
+        .uses = &no_uses,
+    };
+    try std.testing.expectEqual(@as(?u32, null), fixedClobberConflict(&holed, &clobber));
+}
+
+// The slot rule the RELOAD-AT-USE split adds: an interval with `store_at` holds its slot FROM that
+// position, in front of its own first range. `nextIntersection` reads ranges alone, so it answers
+// "no overlap" for a foreign value that dies exactly where the early store lands. Spill-slot
+// coalescing would then put both values on one slot and the store would destroy the foreign one.
+// The wrong answer is a number in generated machine code, on a path only the coalescer takes.
+//
+// This test drives `slotIntervalsInterfere` AND `slotGroupsInterfere`, its caller, so it goes red
+// both when the prefix test leaves the helpers and when the call site goes back to
+// `nextIntersection`. Nothing else here observes this rule: the repo's other tests build no
+// interval with `store_at` that shares a class with a foreign spilled value.
+test "slotIntervalsInterfere: an early store holds the slot in front of the interval" {
+    const p: u32 = 7;
+    var no_uses = [_]UsePos{};
+
+    // `rest`, the spilled remainder of a reload-at-use split. Its value reaches slot 0 at `p`, one
+    // position before its own first range, because the instruction at `p` destroys the register the
+    // head reads there.
+    var rest_ranges = [_]Range{.{ .from = p + 1, .to = p + 6 }};
+    var rest: Interval = .{
+        .value = @enumFromInt(0),
+        .class = 0,
+        .fixed_reg = null,
+        .ranges = &rest_ranges,
+        .uses = &no_uses,
+        .location = .{ .slot = 0 },
+        .store_at = p,
+    };
+
+    // THE LOAD-BEARING CASE. A foreign value that dies AT `p`: its range ends at `p + 1`, so it is
+    // still live where the early store writes. The two range sets never meet.
+    var dies_ranges = [_]Range{.{ .from = p - 3, .to = p + 1 }};
+    var dies: Interval = .{
+        .value = @enumFromInt(1),
+        .class = 0,
+        .fixed_reg = null,
+        .ranges = &dies_ranges,
+        .uses = &no_uses,
+        .location = .{ .slot = 1 },
+    };
+    try std.testing.expectEqual(@as(?u32, null), rest.nextIntersection(&dies));
+    try std.testing.expect(slotIntervalsInterfere(&rest, &dies));
+    // The answer must not depend on which side asks.
+    try std.testing.expect(slotIntervalsInterfere(&dies, &rest));
+
+    // A foreign value that dies one position earlier, ending AT `p`. Ranges are half-open, so it is
+    // dead by the time the store runs and the slot is free for it. This pins the convention the two
+    // helpers share: a range `[x, p)` does not meet the prefix `[p, start())`.
+    var earlier_ranges = [_]Range{.{ .from = p - 3, .to = p }};
+    var earlier: Interval = .{
+        .value = @enumFromInt(2),
+        .class = 0,
+        .fixed_reg = null,
+        .ranges = &earlier_ranges,
+        .uses = &no_uses,
+        .location = .{ .slot = 1 },
+    };
+    try std.testing.expect(!slotIntervalsInterfere(&rest, &earlier));
+    try std.testing.expect(!slotIntervalsInterfere(&earlier, &rest));
+
+    // A SECOND early store, whose own prefix runs over `rest`. Neither range set meets the other and
+    // neither prefix meets the other's prefix, so only the prefix-against-ranges test finds this
+    // pair. A reload-at-use split whose remainder starts after a hole makes exactly this shape.
+    var late_ranges = [_]Range{.{ .from = p + 6, .to = p + 8 }};
+    var late: Interval = .{
+        .value = @enumFromInt(3),
+        .class = 0,
+        .fixed_reg = null,
+        .ranges = &late_ranges,
+        .uses = &no_uses,
+        .location = .{ .slot = 1 },
+        .store_at = p + 1,
+    };
+    try std.testing.expectEqual(@as(?u32, null), rest.nextIntersection(&late));
+    try std.testing.expect(slotIntervalsInterfere(&rest, &late));
+    try std.testing.expect(slotIntervalsInterfere(&late, &rest));
+
+    // A foreign value that ends before the store and starts after it would need both. This one ends
+    // at `p` and carries an early store of its own that is earlier still, so it stays clear of
+    // `rest` on every test.
+    var clear_ranges = [_]Range{.{ .from = p - 4, .to = p }};
+    var clear: Interval = .{
+        .value = @enumFromInt(4),
+        .class = 0,
+        .fixed_reg = null,
+        .ranges = &clear_ranges,
+        .uses = &no_uses,
+        .location = .{ .slot = 1 },
+        .store_at = p - 5,
+    };
+    try std.testing.expect(!slotIntervalsInterfere(&rest, &clear));
+    try std.testing.expect(!slotIntervalsInterfere(&clear, &rest));
+
+    // THE CALLER. `slotGroupsInterfere` is what `coalesceSpillSlots` asks before it unions two
+    // slots. Each interval is its own group here, so the group answer is the pair answer. A call
+    // site back on `nextIntersection` would union slot 0 with slot 1 and let the early store destroy
+    // `dies`.
+    const busy = [_]*Interval{ &rest, &dies };
+    var parent = [_]u32{ 0, 1 };
+    const class_off = [_]u32{0};
+    try std.testing.expect(slotGroupsInterfere(&busy, &parent, &class_off, 0, 0, 1));
+    // A pair that really is clear of each other still answers false, so the guard does not simply
+    // refuse every union.
+    const free = [_]*Interval{ &rest, &earlier };
+    try std.testing.expect(!slotGroupsInterfere(&free, &parent, &class_off, 0, 0, 1));
 }

@@ -982,6 +982,219 @@ test "scan: more same-class params than the register pool spills without crashin
     }
 }
 
+test "scan: an x86_64 argument that is ALSO live across its own call keeps a callee-saved register" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(i32k);
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+
+    // `keep` is defined before the pressure chain, and its next read is the call, so the pressure
+    // spills it and hands the scan a split child that STARTS at the call position.
+    const keep = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = x } });
+
+    // Twelve values, one per gpr the x86_64 pool holds, all read after the call. They fill the pool,
+    // so nothing is free when `keep`'s split child arrives.
+    const nlive = 12;
+    var live: [nlive]Value = undefined;
+    for (&live, 0..) |*v, i| {
+        v.* = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = if (i == 0) x else live[i - 1] } });
+    }
+
+    // Six arguments defined just before the call and dead right after it. They hold the five
+    // callee-saved registers, so every register still free for `keep` at the call is one the call
+    // clobbers. This is the shape that made the whole pool tie on the call position.
+    const nargs = 6;
+    var args: [nargs + 1]Value = undefined;
+    for (args[0..nargs], 0..) |*a, i| {
+        a.* = try func.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = live[i] } });
+    }
+    // `keep` is the seventh argument: it needs a register AT the call, and it is read after the call
+    // too, so the same register must survive the clobber.
+    args[nargs] = keep;
+    const called = try func.appendCall(b, t, "callee", &args);
+
+    var acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = called, .rhs = keep } });
+    for (live) |v| acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = v } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(acc) });
+
+    var desc = try x86_64.x86_64RegDescription(allocator, &func);
+    defer desc.deinit(allocator);
+
+    // The allocation SUCCEEDS. Before the blocked-register pick learned to rank a register the call
+    // clobbers below one it does not, this returned `error.Unsupported` and refused the function.
+    var alloc = try wimmer.allocate(allocator, &func, &desc);
+    defer alloc.deinit(allocator);
+
+    const intervals = try wimmer.buildIntervals(allocator, &func, &desc);
+    defer wimmer.freeIntervals(allocator, intervals);
+    try std.testing.expect(desc.call_sites.len >= 1);
+    const call_pos = desc.call_sites[0].pos;
+
+    // `keep` is in a callee-saved register at the call, which is the only placement that carries it
+    // across the clobber.
+    const keep_segs = alloc.segments.get(keep) orelse return error.MissingSegment;
+    const at_call = segmentAt(keep_segs, call_pos);
+    try std.testing.expect(at_call.loc == .reg);
+    try std.testing.expect(contains(desc.classes[0].callee_saved, at_call.loc.reg));
+
+    // Every must_have_register use still reads a register.
+    for (intervals) |*iv| {
+        if (iv.fixed_reg != null) continue;
+        const v = iv.value orelse continue;
+        const segs = alloc.segments.get(v) orelse continue;
+        for (iv.uses) |u| {
+            if (u.kind != .must_have_register) continue;
+            try std.testing.expect(segmentAt(segs, u.pos).loc == .reg);
+        }
+    }
+}
+
+/// Build the shape that made the x86_64 allocator refuse a whole function. Fourteen i32 block
+/// params are all live across ONE call, and the first SEVEN of them are the arguments of that call.
+///
+/// Each of those seven needs a register AT the call and needs its value again AFTER the call. The
+/// pressure spills them first, so each arrives at the call as a split child whose own start IS the
+/// position of a `must_have_register` use. x86_64 holds only five callee-saved gpr, so the first
+/// five take those and the remaining two find every register in the pool blocked at the call. That
+/// is the position where the allocator used to answer `error.Unsupported`. The reload-at-use split
+/// serves them instead: the value waits in memory, comes back to a caller-saved register for the
+/// one position the call reads it at, and returns to memory in front of the clobber.
+///
+/// aarch64 holds ten callee-saved gpr, enough for all seven, so the same function never reaches the
+/// refusing shape there. It runs here to prove the new branch costs the other targets nothing.
+fn buildCallArgsLivePastCall(func: *Function, t: ir.types.Type) ![14]Value {
+    const b = try func.appendBlock();
+    var params: [14]Value = undefined;
+    for (&params) |*p| p.* = try func.appendBlockParam(b, t);
+
+    const called = try func.appendCall(b, t, "callee", params[0..7]);
+
+    // The reduction reads every param after the call, so all fourteen stay live across it.
+    var acc = called;
+    for (params) |p| acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = p } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(acc) });
+    return params;
+}
+
+/// Assert that every `must_have_register` use of every value in `func` reads a register under
+/// `alloc`. This is the correctness rule a reload-at-use split must not break: the split hands the
+/// use a register for one position, and a wrong placement leaves the use reading a slot.
+fn expectMustHaveUsesInRegisters(
+    allocator: std.mem.Allocator,
+    func: *const Function,
+    desc: *const wimmer.RegDescription,
+    alloc: *const wimmer.Allocation,
+) !void {
+    const intervals = try wimmer.buildIntervals(allocator, func, desc);
+    defer wimmer.freeIntervals(allocator, intervals);
+    for (intervals) |*iv| {
+        if (iv.fixed_reg != null) continue;
+        const v = iv.value orelse continue;
+        const segs = alloc.segments.get(v) orelse continue;
+        for (iv.uses) |u| {
+            if (u.kind != .must_have_register) continue;
+            try std.testing.expect(segmentAt(segs, u.pos).loc == .reg);
+        }
+    }
+}
+
+test "scan: seven call arguments that are ALL live past their own call allocate on x86_64" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(i32k);
+    _ = try buildCallArgsLivePastCall(&func, t);
+
+    var desc = try x86_64.x86_64RegDescription(allocator, &func);
+    defer desc.deinit(allocator);
+
+    // Without the reload-at-use split this call answers `error.Unsupported`.
+    var alloc = try wimmer.allocate(allocator, &func, &desc);
+    defer alloc.deinit(allocator);
+
+    // More values are live than the pool holds, so something reached a slot.
+    try std.testing.expect(alloc.slot_count_per_class[0] > 0);
+    try expectMustHaveUsesInRegisters(allocator, &func, &desc, &alloc);
+}
+
+test "scan: seven call arguments that are ALL live past their own call allocate on aarch64" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(i32k);
+    _ = try buildCallArgsLivePastCall(&func, t);
+
+    var desc = try aarch64.aarch64RegDescription(allocator, &func);
+    defer desc.deinit(allocator);
+
+    var alloc = try wimmer.allocate(allocator, &func, &desc);
+    defer alloc.deinit(allocator);
+
+    try std.testing.expect(alloc.slot_count_per_class[0] > 0);
+    try expectMustHaveUsesInRegisters(allocator, &func, &desc, &alloc);
+}
+
+test "scan: the reload-at-use store is emitted IN FRONT of the call, not behind it" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(i32k);
+    const params = try buildCallArgsLivePastCall(&func, t);
+
+    var desc = try x86_64.x86_64RegDescription(allocator, &func);
+    defer desc.deinit(allocator);
+
+    var alloc = try wimmer.allocate(allocator, &func, &desc);
+    defer alloc.deinit(allocator);
+
+    try std.testing.expect(desc.call_sites.len >= 1);
+    const call_pos = desc.call_sites[0].pos;
+    try std.testing.expect(call_pos > 0);
+
+    // The POSITION of the store is what makes a reload-at-use split correct, and no allocation-level
+    // test reads it. The execution test in `tests/cross_target.zig` is the other witness, and it
+    // SKIPS on a host with no qemu-x86_64, so a store emitted behind the call would pass the whole
+    // suite there. This test reads the position directly and needs no emulator.
+    //
+    // A reload-at-use value is one whose segments go REGISTER at the call and SLOT at the position
+    // right after it. The register is the one the call reads the argument from, and the call
+    // destroys it, so the value must reach its slot BEFORE the call runs. The store therefore sits
+    // at the call position. At the position after the call, where a plain spill would put it, it
+    // would read a register the call already overwrote.
+    var reload_at_use: usize = 0;
+    for (params) |p| {
+        const segs = alloc.segments.get(p) orelse continue;
+        if (segs.len < 2) continue;
+        for (segs[0 .. segs.len - 1], segs[1..]) |head, rest| {
+            if (head.loc != .reg) continue;
+            if (rest.loc != .slot) continue;
+            if (rest.from != call_pos + 1) continue;
+            reload_at_use += 1;
+
+            // The store runs at the call position, and it reads what the value holds just before
+            // that position, never the register the head takes there. The head's register is filled
+            // by a reload in the same parallel move, so reading it would read an unwritten register.
+            const before = segmentAt(segs, call_pos - 1);
+            var stores: usize = 0;
+            for (alloc.actions) |act| {
+                if (act.value != p) continue;
+                try std.testing.expect(act.at != call_pos + 1);
+                if (act.at != call_pos) continue;
+                if (act.dst != .slot) continue;
+                stores += 1;
+                try std.testing.expectEqual(rest.loc.slot, act.dst.slot);
+                try std.testing.expect(std.meta.eql(before.loc, act.src));
+            }
+            try std.testing.expectEqual(@as(usize, 1), stores);
+        }
+    }
+    // The shape really does take the branch. Without this the loop above could pass by finding
+    // nothing at all.
+    try std.testing.expect(reload_at_use > 0);
+}
+
 test "scan: a VECTOR value live across a call is split at the call (the vector-quirk clobber forces it out of fp regs)" {
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
@@ -1521,6 +1734,77 @@ test "verify: a used value interval with no location is flagged unassigned" {
     defer allocator.free(violations);
     try std.testing.expectEqual(@as(usize, 1), violations.len);
     try std.testing.expect(violations[0].kind == .unassigned);
+}
+
+// The three tests below cover verifier CHECK 5, the early-store obligation a reload-at-use split
+// adds. They build the three pieces that split makes: the value's earlier piece, the one-position
+// head that the use reads in a register, and the spilled remainder whose slot is written at the
+// head's position. Position 7 is the clobbering instruction throughout.
+
+test "verify: a correct early store has no violations" {
+    const allocator = std.testing.allocator;
+    const v0: Value = @enumFromInt(0);
+    const v1: Value = @enumFromInt(1);
+    // The remainder stores into slot 0 at position 7, one position before its own first range. The
+    // value is in x3 up to 7, so the store has a live source to read. The foreign value dies AT 7,
+    // so its range ends at 7 and it is gone before the store writes its slot, which is a different
+    // slot anyway.
+    var ivs = [_]wimmer.Interval{
+        try ownedInterval(allocator, v0, 0, null, &.{.{ .from = 0, .to = 7 }}, &.{}, .{ .reg = 3 }),
+        try ownedInterval(allocator, v0, 0, null, &.{.{ .from = 7, .to = 8 }}, &.{.{ .pos = 7, .kind = .must_have_register }}, .{ .reg = 2 }),
+        try ownedInterval(allocator, v0, 0, null, &.{.{ .from = 8, .to = 12 }}, &.{}, .{ .slot = 0 }),
+        try ownedInterval(allocator, v1, 0, null, &.{.{ .from = 4, .to = 7 }}, &.{}, .{ .slot = 1 }),
+    };
+    defer for (ivs) |iv| freeOwnedInterval(allocator, iv);
+    ivs[2].store_at = 7;
+
+    const violations = try wimmer.verifyIntervals(allocator, &ivs);
+    defer allocator.free(violations);
+    try std.testing.expectEqual(@as(usize, 0), violations.len);
+}
+
+test "verify: an early store with no live source is flagged" {
+    const allocator = std.testing.allocator;
+    const v0: Value = @enumFromInt(0);
+    // Same shape with the earlier piece removed. The head starts AT the store position, and a store
+    // reads what the value held BEFORE that position, so the head is not a source. Nothing holds the
+    // value there and the store would write another value's bits.
+    var ivs = [_]wimmer.Interval{
+        try ownedInterval(allocator, v0, 0, null, &.{.{ .from = 7, .to = 8 }}, &.{.{ .pos = 7, .kind = .must_have_register }}, .{ .reg = 2 }),
+        try ownedInterval(allocator, v0, 0, null, &.{.{ .from = 8, .to = 12 }}, &.{}, .{ .slot = 0 }),
+    };
+    defer for (ivs) |iv| freeOwnedInterval(allocator, iv);
+    ivs[1].store_at = 7;
+
+    const violations = try wimmer.verifyIntervals(allocator, &ivs);
+    defer allocator.free(violations);
+    try std.testing.expectEqual(@as(usize, 1), violations.len);
+    try std.testing.expect(violations[0].kind == .store_src_dead);
+    try std.testing.expectEqual(@as(u32, 7), violations[0].pos);
+}
+
+test "verify: another value live in the slot at the early-store position is flagged" {
+    const allocator = std.testing.allocator;
+    const v0: Value = @enumFromInt(0);
+    const v1: Value = @enumFromInt(1);
+    // The foreign value now shares slot 0 and lives to 8, so it still holds the slot at 7 where the
+    // early store writes. Their RANGES never meet, which is why the ranges alone cannot answer this.
+    // This is the union `coalesceSpillSlots` must refuse, checked again on the result.
+    var ivs = [_]wimmer.Interval{
+        try ownedInterval(allocator, v0, 0, null, &.{.{ .from = 0, .to = 7 }}, &.{}, .{ .reg = 3 }),
+        try ownedInterval(allocator, v0, 0, null, &.{.{ .from = 7, .to = 8 }}, &.{.{ .pos = 7, .kind = .must_have_register }}, .{ .reg = 2 }),
+        try ownedInterval(allocator, v0, 0, null, &.{.{ .from = 8, .to = 12 }}, &.{}, .{ .slot = 0 }),
+        try ownedInterval(allocator, v1, 0, null, &.{.{ .from = 4, .to = 8 }}, &.{}, .{ .slot = 0 }),
+    };
+    defer for (ivs) |iv| freeOwnedInterval(allocator, iv);
+    ivs[2].store_at = 7;
+
+    const violations = try wimmer.verifyIntervals(allocator, &ivs);
+    defer allocator.free(violations);
+    try std.testing.expectEqual(@as(usize, 1), violations.len);
+    try std.testing.expect(violations[0].kind == .store_slot_busy);
+    try std.testing.expectEqual(@as(usize, 2), violations[0].a);
+    try std.testing.expectEqual(@as(usize, 3), violations[0].b);
 }
 
 test "scan: a scalar fp value live across many calls stays valid via the narrow-preserved v8..v15 home" {
