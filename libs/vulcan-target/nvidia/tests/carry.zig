@@ -57,9 +57,12 @@
 //! `compute.Runner.init` gives `error.SkipZigTest` when no GPU answers, and
 //! `gpu()` turns a permission error or a missing driver node into the same
 //! result. A machine with no NVIDIA hardware skips every live test here. The
-//! structural test at the end needs no GPU and always runs.
+//! structural test at the end needs no GPU and always runs. A host that is not
+//! Linux skips EARLIER, at `hasDriver`, because the transport would send Linux
+//! syscalls to a kernel that does not know them.
 
 const std = @import("std");
+const host = @import("builtin");
 const ir = @import("vulcan-ir");
 const gpu_abi = @import("vulcan-gpu");
 const target = @import("vulcan-target");
@@ -115,6 +118,16 @@ comptime {
     std.debug.assert(chain_carried_va & 0xFFFF_FFFF == chain_dropped_va);
 }
 
+/// Whether this host can reach the NVIDIA kernel driver at all. `nvidia.zig` picks its
+/// transport by target OS, and it treats EVERY OS that is not freestanding as Linux. So on
+/// macOS `Runner.init` sends Linux syscall numbers to the XNU kernel, XNU refuses a number
+/// it does not know with SIGSYS, and that signal kills the whole test process instead of
+/// failing one test. The driver is a Linux kernel module, so no other host can run these
+/// tests. Ask this FIRST, before a call that can reach the transport.
+fn hasDriver() bool {
+    return host.os.tag == .linux;
+}
+
 /// Whether `err` means "this machine has no usable NVIDIA GPU". A DISPATCH
 /// failure such as `error.GridTimeout` is deliberately absent: a kernel that
 /// hangs must fail the test and not skip it.
@@ -133,6 +146,7 @@ fn noGpu(err: anyerror) bool {
 
 /// Open the GPU, or skip the test when there is none. See `noGpu`.
 fn gpu() !compute.Runner {
+    if (!hasDriver()) return error.SkipZigTest;
     return compute.Runner.init() catch |err| {
         if (noGpu(err)) return error.SkipZigTest;
         return err;
