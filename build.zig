@@ -111,6 +111,19 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // The Zig frontend: parse a Zig source file's extended subset with `std.zig.Ast` and
+    // lower it to Vulcan IR. Its library tests still exercise the host JIT; the CLI emits
+    // relocatable objects and uses the shared ELF linker for executable output.
+    const vulcan_zig = b.addModule("vulcan-zig", .{
+        .root_source_file = b.path("libs/vulcan-zig.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+        },
+    });
+
     // The container emitters (PE/flat image) are standalone pure-byte modules, used by
     // the freestanding proof below.
     const vulcan_pe = b.createModule(.{ .root_source_file = b.path("libs/vulcan-target/pe.zig"), .target = target, .optimize = optimize });
@@ -141,6 +154,24 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "vulcan-glsl", .module = vulcan_glsl }},
     }) });
     b.installArtifact(glsl_cli);
+
+    // The Zig frontend CLI: compile the supported subset to a relocatable object or link
+    // a static ELF executable. `zig_lib_dir` lets it resolve `@import("std")` against the
+    // same standard library this build uses.
+    const zig_cli_opts = b.addOptions();
+    zig_cli_opts.addOption([]const u8, "zig_lib_dir", b.graph.zig_lib_directory.path.?);
+    const zig_cli = b.addExecutable(.{ .name = "vulcan-zig", .root_module = b.createModule(.{
+        .root_source_file = b.path("frontends/vulcan-zig.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-zig", .module = vulcan_zig },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+            .{ .name = "vulcan-link", .module = vulcan_link },
+            .{ .name = "build_options", .module = zig_cli_opts.createModule() },
+        },
+    }) });
+    b.installArtifact(zig_cli);
 
     // The Vulcan C Compiler driver executable (clang-compatible CLI surface, SM1).
     // Hoisted into a `const` module (SM15 M5a) so both the exe and its in-file `parseArgs`
@@ -218,6 +249,12 @@ pub fn build(b: *std.Build) void {
             if (b.args) |a| run_glsl.addArgs(a);
             const run_glsl_step = b.step("run-glsl", "Run the GLSL->SPIR-V compiler: -- <input.glsl> [stage] [-o out.spv]");
             run_glsl_step.dependOn(&run_glsl.step);
+
+            // The Zig frontend CLI runner (zig_cli is declared above).
+            const run_zig = b.addRunArtifact(zig_cli);
+            if (b.args) |a| run_zig.addArgs(a);
+            const run_zig_step = b.step("run-zig", "Run vulcan-zig build-exe or build-obj");
+            run_zig_step.dependOn(&run_zig.step);
 
             // The GLSL -> target-disassembly debugging tool: compile a shader and print the
             // native (or Wasm) code for one of its functions.
@@ -719,6 +756,45 @@ pub fn build(b: *std.Build) void {
 
     const cc_tests = b.addTest(.{ .root_module = vulcan_cc });
     test_step.dependOn(&b.addRunArtifact(cc_tests).step);
+
+    // The Zig frontend's own module tests: type resolution, lowering, and structural checks.
+    const zig_tests = b.addTest(.{ .root_module = vulcan_zig });
+    test_step.dependOn(&b.addRunArtifact(zig_tests).step);
+
+    // Zig frontend execution tests: lower the extended subset to IR, then JIT for the host
+    // and run.
+    const zig_exec = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-zig/tests/native.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-zig", .module = vulcan_zig },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+        },
+    }) });
+    const zig_test_step = b.step("test-zig", "Run Zig frontend execution tests");
+    const run_zig_exec = b.addRunArtifact(zig_exec);
+    zig_test_step.dependOn(&run_zig_exec.step);
+    test_step.dependOn(&run_zig_exec.step);
+
+    // Zig frontend differential oracle: the real `zig` compiler runs the same source (with a
+    // synthesized `main` printing the call's result) and its stdout is compared against this
+    // frontend's own JIT execution. `zig_exe` is the same `zig` that builds this, so the test
+    // does not depend on the PATH. Skips cleanly when that `zig` cannot run.
+    var zig_toolchain_opts = b.addOptions();
+    zig_toolchain_opts.addOption([]const u8, "zig_exe", b.graph.zig_exe);
+    const zig_toolchain = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-zig/tests/toolchain.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-zig", .module = vulcan_zig },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+            .{ .name = "build_options", .module = zig_toolchain_opts.createModule() },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(zig_toolchain).step);
 
     // The freestanding object is a compile check too (no run), so `test` keeps the core
     // building for whatever target is selected.

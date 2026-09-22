@@ -3497,7 +3497,40 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     }
     // Reserve a frame slot for each callee-saved register the allocation used.
     var used_saved: std.ArrayList(struct { reg: Reg, off: i12 }) = .empty;
+    // x8 (s0/fp) is reserved as the second spill/return staging scratch.
+    // Unlike the caller-saved temporaries, it belongs to the callee: preserve it
+    // whenever emission may touch it, including a two-register return with no
+    // ordinary spills. Otherwise a C/Zig caller using s0 as its frame pointer
+    // resumes with a corrupted stack frame.
+    var uses_s0_scratch = alloc.spill_count != 0 or alloc.vector_spill_count != 0 or
+        alloc.vpu_vector_spill_count != 0 or ir.function.functionUsesF16(func);
+    if (!uses_s0_scratch) for (0..func.blockCount()) |bi| {
+        if (!reachable[bi]) continue;
+        const block: Block = @enumFromInt(bi);
+        if (func.terminator(block)) |term| {
+            if (term == .ret and term.ret.count > 1) {
+                uses_s0_scratch = true;
+                break;
+            }
+        }
+        for (func.blockInsts(block)) |inst| {
+            switch (func.opcode(inst)) {
+                .call_indirect, .va_start, .va_arg => {
+                    uses_s0_scratch = true;
+                    break;
+                },
+                else => {},
+            }
+        }
+        if (uses_s0_scratch) break;
+    };
     defer used_saved.deinit(allocator);
+    if (uses_s0_scratch) {
+        frame = alignUp(frame, 8);
+        if (frame > 2047) return error.Unsupported;
+        try used_saved.append(allocator, .{ .reg = spill_scratch1, .off = @intCast(frame) });
+        frame += 8;
+    }
     for (saved_regs) |s| {
         var used = false;
         var it = alloc.int.valueIterator();

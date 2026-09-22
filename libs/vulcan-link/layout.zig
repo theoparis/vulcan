@@ -280,9 +280,13 @@ pub fn computeScriptPlacement(allocator: std.mem.Allocator, parsed: []ParsedObje
                                 for (obj.sections, 0..) |*isec, si| {
                                     if (!sectionMatchesPattern(pat, isec)) continue;
                                     const gi = section_place_base[oi] + si;
+                                    if (sec.discard) {
+                                        if (sectionPresent(isec)) sec_placed[gi] = true;
+                                        continue;
+                                    }
                                     if (sec_placed[gi]) continue;
                                     if (!sectionPresent(isec)) continue;
-                                    const class = classForSection(isec);
+                                    const class: Class = if (sec.no_load) .bss else classForSection(isec);
                                     dot = alignUpTo(dot, defaultAlign(isec));
                                     if (!section_started) {
                                         section_started = true;
@@ -603,6 +607,45 @@ test "computeScriptPlacement: location counter, output sections, ALIGN, and boun
     try std.testing.expectEqualSlices(u8, &t0, bytes[0..4]);
     try std.testing.expectEqualSlices(u8, &t1, bytes[4..10]);
     try std.testing.expectEqualSlices(u8, &d1, bytes[0x10..0x14]);
+}
+
+test "computeScriptPlacement: DISCARD drops sections and NOLOAD reserves memory only" {
+    const allocator = std.testing.allocator;
+    var text = [_]u8{ 1, 2, 3, 4 };
+    var comment = [_]u8{ 9, 9, 9, 9, 9, 9, 9, 9 };
+    var noinit = [_]u8{ 5, 5, 5, 5, 5, 5, 5, 5 };
+    var symbols = [_]elf.ObjSymbol{
+        .{ .name = "_start", .value = 0, .defined = true, .local = false, .section_index = 0 },
+        .{ .name = "discarded", .value = 0, .defined = true, .local = false, .section_index = 1 },
+        .{ .name = "scratch", .value = 0, .defined = true, .local = false, .section_index = 2 },
+    };
+    var sections = [_]elf.ObjSection{
+        .{ .name = ".text", .flags = elf.SHF_ALLOC | elf.SHF_EXECINSTR, .bytes = &text, .size = text.len, .is_nobits = false },
+        .{ .name = ".comment", .flags = 0, .bytes = &comment, .size = comment.len, .is_nobits = false },
+        .{ .name = ".noinit", .flags = elf.SHF_ALLOC | elf.SHF_WRITE, .bytes = &noinit, .size = noinit.len, .is_nobits = false },
+    };
+    var parsed = [_]ParsedObject{.{ .arch = .aarch64, .symbols = &symbols, .sections = &sections }};
+    const src =
+        \\ENTRY(_start)
+        \\SECTIONS {
+        \\  . = 0x400000;
+        \\  .text : { *(.text*) }
+        \\  /DISCARD/ : { *(.comment*) }
+        \\  .noinit (NOLOAD) : { *(.noinit*) }
+        \\}
+    ;
+    var scr = try script.parse(allocator, src, null);
+    defer scr.deinit();
+    var placement = try computeScriptPlacement(allocator, &parsed, &scr, .aarch64);
+    defer placement.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u64, 0x400000), placement.entry);
+    try std.testing.expectEqual(@as(u64, 0x400000), findSymbol(placement.symbols, "_start").?);
+    try std.testing.expectEqual(@as(u64, 0x400008), findSymbol(placement.symbols, "scratch").?);
+    try std.testing.expect(findSymbol(placement.symbols, "discarded") == null);
+    try std.testing.expectEqual(@as(usize, 4), placement.segments[0].bytes.len);
+    try std.testing.expectEqual(@as(u64, 16), placement.segments[0].memsz);
+    try std.testing.expectEqualSlices(u8, &text, placement.segments[0].bytes);
 }
 
 test "computeScriptPlacement: a duplicate defined symbol across objects errors" {

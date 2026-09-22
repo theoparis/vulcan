@@ -44,6 +44,7 @@ pub const FuncSym = struct { name: []const u8, offset: u64 };
 /// Any defined symbol, by absolute value (address): a function or a data object. Used to resolve
 /// branch and `adrp` targets to names when disassembling.
 pub const Symbol = struct { name: []const u8, addr: u64, size: u64, is_func: bool };
+pub const TextRelocation = struct { offset: u64, symbol: []const u8, r_type: u32, addend: i64 };
 
 /// The `std.elf` header structs for a given width. `peek` decodes each from the mapped image
 /// and normalizes the little-endian fields to host order, so either host byte order works.
@@ -52,6 +53,7 @@ fn Layout(comptime is_64: bool) type {
         const Ehdr = elf.Elf64_Ehdr;
         const Shdr = elf.Elf64_Shdr;
         const Sym = elf.Elf64_Sym;
+        const Rela = elf.Elf64_Rela;
     } else struct {
         const Ehdr = elf.Elf32_Ehdr;
         const Shdr = elf.Elf32_Shdr;
@@ -199,6 +201,55 @@ fn functionsGeneric(comptime L: type, allocator: std.mem.Allocator, image: []con
     return out;
 }
 
+/// Read ELF64 RELA records targeting `.text`. Relocation names borrow from `image`.
+pub fn textRelocations(allocator: std.mem.Allocator, image: []const u8) (Error || std.mem.Allocator.Error)![]TextRelocation {
+    if (!try is64(image)) return error.Unsupported;
+    const L = Layout(true);
+    const eh = try peek(L.Ehdr, image, 0);
+    const names = try sectionNames(L, image, eh);
+    var text_idx: ?u16 = null;
+    var symtab: ?L.Shdr = null;
+    var rela: ?L.Shdr = null;
+    var i: u16 = 0;
+    while (i < eh.e_shnum) : (i += 1) {
+        const sh = try shdr(L, image, eh, i);
+        if (std.mem.eql(u8, nameAt(names, sh.sh_name), ".text")) text_idx = i;
+        if (sh.sh_type == elf.SHT_SYMTAB) symtab = sh;
+    }
+    const tx = text_idx orelse return error.NoText;
+    i = 0;
+    while (i < eh.e_shnum) : (i += 1) {
+        const sh = try shdr(L, image, eh, i);
+        if (sh.sh_type == elf.SHT_RELA and sh.sh_info == tx) {
+            rela = sh;
+            break;
+        }
+    }
+    const rs = rela orelse return allocator.alloc(TextRelocation, 0);
+    const sym = symtab orelse return error.Malformed;
+    if (rs.sh_link >= eh.e_shnum or rs.sh_entsize == 0 or sym.sh_entsize == 0 or sym.sh_link >= eh.e_shnum) return error.Malformed;
+    const symstr_section = try shdr(L, image, eh, @intCast(sym.sh_link));
+    const symstr = try slice(image, symstr_section.sh_offset, symstr_section.sh_size);
+    var result: std.ArrayList(TextRelocation) = .empty;
+    errdefer result.deinit(allocator);
+    const count = rs.sh_size / rs.sh_entsize;
+    var n: u64 = 0;
+    while (n < count) : (n += 1) {
+        const r = try peek(L.Rela, image, try tableOffset(rs.sh_offset, n, rs.sh_entsize));
+        const symbol_index: u64 = r.r_sym();
+        if (symbol_index >= sym.sh_size / sym.sh_entsize) return error.Malformed;
+        const s = try peek(L.Sym, image, try tableOffset(sym.sh_offset, symbol_index, sym.sh_entsize));
+        const symbol = nameAt(symstr, s.st_name);
+        if (symbol.len == 0) return error.Malformed;
+        try result.append(allocator, .{
+            .offset = r.r_offset,
+            .symbol = symbol,
+            .r_type = r.r_type(),
+            .addend = r.r_addend,
+        });
+    }
+    return result.toOwnedSlice(allocator);
+}
 pub fn symbols(allocator: std.mem.Allocator, image: []const u8) (Error || std.mem.Allocator.Error)![]Symbol {
     return if (try is64(image)) symbolsGeneric(Layout(true), allocator, image) else symbolsGeneric(Layout(false), allocator, image);
 }

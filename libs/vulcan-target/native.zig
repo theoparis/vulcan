@@ -319,21 +319,25 @@ pub fn writeObjectData(allocator: std.mem.Allocator, funcs: []const ModuleFuncti
 /// `object.writeModule` gets called) from the neutral `funcs`/`data`, so the caller
 /// builds its inputs once and can target any of the 4 without branching itself.
 pub fn writeObjectDataFor(allocator: std.mem.Allocator, target: link.Arch, funcs: []const ModuleFunction, data: []const ObjData) Error![]u8 {
-    return writeObjectDataForModel(allocator, target, funcs, data, null);
+    return writeObjectDataForModelWithIo(allocator, target, funcs, data, null, null);
+}
+
+pub fn writeObjectDataForWithIo(allocator: std.mem.Allocator, target: link.Arch, funcs: []const ModuleFunction, data: []const ObjData, io: std.Io) Error![]u8 {
+    return writeObjectDataForModelWithIo(allocator, target, funcs, data, null, io);
 }
 
 /// Like `writeObjectDataFor`, but selects code for a specific microarch `model` on
 /// the 3 model-capable backends (aarch64, x86_64, riscv64). The caller guarantees
-/// `model.?.arch` matches `target`, so this does not re-check the arch itself. `x86`
-/// (32-bit) has no model support and always takes the generic path. A null `model`
-/// keeps every backend on its generic path, so `writeObjectDataFor` above is exactly
-/// this function called with `null`, so it stays byte-identical to before it existed.
 pub fn writeObjectDataForModel(allocator: std.mem.Allocator, target: link.Arch, funcs: []const ModuleFunction, data: []const ObjData, model: ?*const mm.Model) Error![]u8 {
+    return writeObjectDataForModelWithIo(allocator, target, funcs, data, model, null);
+}
+
+pub fn writeObjectDataForModelWithIo(allocator: std.mem.Allocator, target: link.Arch, funcs: []const ModuleFunction, data: []const ObjData, model: ?*const mm.Model, io: ?std.Io) Error![]u8 {
     return switch (target) {
-        .aarch64 => writeObjectDataWithModel(@import("aarch64.zig"), allocator, funcs, data, model),
-        .x86_64 => writeObjectDataWithModel(@import("x86_64.zig"), allocator, funcs, data, model),
-        .riscv64 => writeObjectDataWithModel(@import("riscv64.zig"), allocator, funcs, data, model),
-        .x86 => writeObjectDataWith(@import("x86.zig"), allocator, funcs, data), // 32-bit x86 has no model
+        .aarch64 => writeObjectDataWithModel(@import("aarch64.zig"), allocator, funcs, data, model, io),
+        .x86_64 => writeObjectDataWithModel(@import("x86_64.zig"), allocator, funcs, data, model, null),
+        .riscv64 => writeObjectDataWithModel(@import("riscv64.zig"), allocator, funcs, data, model, null),
+        .x86 => writeObjectDataWith(@import("x86.zig"), allocator, funcs, data),
     };
 }
 
@@ -408,10 +412,11 @@ fn writeObjectDataWith(comptime B: type, allocator: std.mem.Allocator, funcs: []
 /// serializing, so `B.object.writeModule` selects code tuned for it. A null `model`
 /// leaves the built module's `model` at its default `null`, so this is
 /// byte-identical to `writeObjectDataWith` in that case.
-fn writeObjectDataWithModel(comptime B: type, allocator: std.mem.Allocator, funcs: []const ModuleFunction, data: []const ObjData, model: ?*const mm.Model) Error![]u8 {
+fn writeObjectDataWithModel(comptime B: type, allocator: std.mem.Allocator, funcs: []const ModuleFunction, data: []const ObjData, model: ?*const mm.Model, io: ?std.Io) Error![]u8 {
     var built = try buildBackendModule(B, allocator, funcs, data);
     defer built.deinit(allocator);
     built.module.model = model;
+    if (B == @import("aarch64.zig")) return B.object.writeModuleWithIo(allocator, &built.module, io);
     return B.object.writeModule(allocator, &built.module);
 }
 

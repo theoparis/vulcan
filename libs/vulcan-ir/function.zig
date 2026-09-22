@@ -668,6 +668,10 @@ pub const Function = struct {
     /// `static inline` helper (glibc's `__bswap_16`) do not collide at link time. Defaults
     /// to `false` (external/global), so every existing construction site stays byte-identical.
     is_local: bool = false,
+    /// Raw target assembly for a naked function body. The target object writer assembles it
+    /// directly; ordinary IR lowering and the function prologue/epilogue are bypassed.
+    naked_asm: ?[]const u8 = null,
+    link_section: ?[]const u8 = null,
 
     pub fn init(allocator: std.mem.Allocator) Function {
         return .{
@@ -698,6 +702,8 @@ pub const Function = struct {
         for (self.attributes.items) |entry| self.freeAttr(entry.attr);
         self.attributes.deinit(self.allocator);
         for (self.symbols.items) |s| self.allocator.free(s);
+        if (self.naked_asm) |asm_body| self.allocator.free(asm_body);
+        if (self.link_section) |section| self.allocator.free(section);
         self.symbols.deinit(self.allocator);
         self.types.deinit();
     }
@@ -721,6 +727,8 @@ pub const Function = struct {
         out.num_fixed_params = self.num_fixed_params;
         out.sret = self.sret;
         out.is_local = self.is_local;
+        if (self.naked_asm) |asm_body| out.naked_asm = try allocator.dupe(u8, asm_body);
+        if (self.link_section) |section| out.link_section = try allocator.dupe(u8, section);
 
         // Types: re-intern each kind in the original's order. The original table is deduped (every
         // kind unique), and interning is order-preserving, so the n-th kind receives handle n exactly,

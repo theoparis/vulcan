@@ -578,6 +578,23 @@ fn applyFoldRewrite(func: *Function, fold: *const addrfold.Analysis) void {
     }
 }
 
+/// Resolve only the AArch64 inline-assembly instructions lowered by the Zig frontend.
+/// Unrecognized templates remain errors; none silently turn into no-ops.
+fn inlineAsmWord(name: []const u8) ?u32 {
+    if (std.mem.eql(u8, name, "__vulcan_aarch64_asm_wfe")) return 0xd503205f;
+    if (std.mem.eql(u8, name, "__vulcan_aarch64_asm_sev")) return 0xd503209f;
+    if (std.mem.eql(u8, name, "__vulcan_aarch64_asm_isb")) return 0xd5033fdf;
+    if (std.mem.eql(u8, name, "__vulcan_aarch64_asm_dsb_sy")) return 0xd5033f9f;
+    if (std.mem.eql(u8, name, "__vulcan_aarch64_asm_dsb_ish")) return 0xd5033b9f;
+    if (std.mem.eql(u8, name, "__vulcan_aarch64_asm_eret")) return 0xd69f03e0;
+    if (std.mem.eql(u8, name, "__vulcan_aarch64_asm_hvc_0")) return 0xd4000002;
+    if (std.mem.eql(u8, name, "__vulcan_aarch64_asm_daifclr_2")) return 0xd50342ff;
+    if (std.mem.eql(u8, name, "__vulcan_aarch64_asm_daifset_f")) return 0xd5034fdf;
+    if (std.mem.eql(u8, name, "__vulcan_aarch64_asm_ic_iallu")) return 0xd508751f;
+    if (std.mem.eql(u8, name, "__vulcan_aarch64_asm_tlbi_vmalle1")) return 0xd508871f;
+    return null;
+}
+
 /// Compile `func` to A64 words and call relocations. The caller owns the result.
 /// `fetch_align` is the microarch model's fetch granularity in bytes (0 disables loop-header
 /// alignment, the behavior of every existing caller). When greater than one instruction word,
@@ -1579,6 +1596,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     const base = try ctx.loadOp(allocator, &code, fold.baseOf(func, inst), spill_op[1]);
                     try emitStore(allocator, &code, func, st.value, val, base, @intCast(fold.offOf(inst)), fp16);
                 },
+                .atomic_rmw => |rmw| try emitAtomicRmw(allocator, &code, func, ctx, rmw, func.instResult(inst)),
                 .prefetch => |pf| {
                     // A software prefetch hint: bring [ptr] into L1, no result, no
                     // observable effect on the function.
@@ -1622,29 +1640,40 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
                 .call => |c| {
-                    try ctx.emitCallArgs(allocator, &code, func.valueList(c.args), c.sret);
-                    try relocs.append(allocator, .{ .offset = code.items.len, .symbol = func.symbolName(c.symbol) });
-                    try code.append(allocator, encode.bl(0));
-                    if (func.instResult(inst)) |result| {
-                        const rd = ctx.resultReg(result);
-                        // An f128 result comes back in the whole 128-bit v0 (a soft-fp `__*tf*` call
-                        // returns its quad in v0), so capture it with the 128-bit `movVec`, not the
-                        // 64-bit `fmovReg` an f32/f64 uses.
-                        try code.append(allocator, if (regClass(func, result) == .fpr)
-                            (if (isQuad(func, result)) encode.movVec(rd, @enumFromInt(0)) else encode.fmovReg(rd, @enumFromInt(0)))
-                        else
-                            encode.mov(rd, .x0));
-                        try storeResult(allocator, &code, ctx, result, rd);
-                    }
-                    if (c.ret_dest) |dest| {
-                        // A struct returned in registers. The callee left
-                        // each eightbyte in the next return register of its bank (integer x0/x1,
-                        // float v0..v3). REMATERIALIZE the dest's frame address (an alloca, available
-                        // after the call, never a value clobbered by it) into a scratch that is not
-                        // a return register, then store each return register into `[dest + offset]`.
-                        const doff = alloca_base + alloca_off.get(dest).?;
-                        try emitFrameImm(allocator, &code, false, spill_op[0], sp, doff);
-                        try emitStructRetStore(allocator, &code, c.ret_pieces, c.ret_regs, spill_op[0]);
+                    const call_name = func.symbolName(c.symbol);
+                    if (std.mem.eql(u8, call_name, "__vulcan_aarch64_asm_uefi_transfer")) {
+                        if (func.valueList(c.args).len != 4 or func.instResult(inst) != null or c.ret_dest != null) return error.Unsupported;
+                        try ctx.emitCallArgs(allocator, &code, func.valueList(c.args), c.sret);
+                        try code.append(allocator, encode.mov(.x30, .x3));
+                        try code.append(allocator, 0xd61f0040); // br x2
+                    } else if (inlineAsmWord(call_name)) |word| {
+                        if (func.valueList(c.args).len != 0 or func.instResult(inst) != null or c.ret_dest != null) return error.Unsupported;
+                        try code.append(allocator, word);
+                    } else {
+                        try ctx.emitCallArgs(allocator, &code, func.valueList(c.args), c.sret);
+                        try relocs.append(allocator, .{ .offset = code.items.len, .symbol = func.symbolName(c.symbol) });
+                        try code.append(allocator, encode.bl(0));
+                        if (func.instResult(inst)) |result| {
+                            const rd = ctx.resultReg(result);
+                            // An f128 result comes back in the whole 128-bit v0 (a soft-fp `__*tf*` call
+                            // returns its quad in v0), so capture it with the 128-bit `movVec`, not the
+                            // 64-bit `fmovReg` an f32/f64 uses.
+                            try code.append(allocator, if (regClass(func, result) == .fpr)
+                                (if (isQuad(func, result)) encode.movVec(rd, @enumFromInt(0)) else encode.fmovReg(rd, @enumFromInt(0)))
+                            else
+                                encode.mov(rd, .x0));
+                            try storeResult(allocator, &code, ctx, result, rd);
+                        }
+                        if (c.ret_dest) |dest| {
+                            // A struct returned in registers. The callee left
+                            // each eightbyte in the next return register of its bank (integer x0/x1,
+                            // float v0..v3). REMATERIALIZE the dest's frame address (an alloca, available
+                            // after the call, never a value clobbered by it) into a scratch that is not
+                            // a return register, then store each return register into `[dest + offset]`.
+                            const doff = alloca_base + alloca_off.get(dest).?;
+                            try emitFrameImm(allocator, &code, false, spill_op[0], sp, doff);
+                            try emitStructRetStore(allocator, &code, c.ret_pieces, c.ret_regs, spill_op[0]);
+                        }
                     }
                 },
                 .call_indirect => |c| {
@@ -2648,6 +2677,50 @@ fn storeResult(allocator: std.mem.Allocator, code: *std.ArrayList(u32), ctx: Ctx
                 try code.append(allocator, encode.strOff(reg, sp, off));
             }
         },
+    }
+}
+
+fn emitAtomicRmw(
+    allocator: std.mem.Allocator,
+    code: *std.ArrayList(u32),
+    func: *const Function,
+    ctx: Ctx,
+    rmw: ir.function.AtomicRmw,
+    result: ?Value,
+) Error!void {
+    if (rmw.compare != null) return error.Unsupported;
+    if (rmw.op != .add and rmw.op != .exchange) return error.Unsupported;
+    const bits = switch (func.types.type_kind(func.valueType(rmw.value))) {
+        .int => |int| int.bits,
+        else => return error.Unsupported,
+    };
+    if (bits != 8 and bits != 16 and bits != 32 and bits != 64) return error.Unsupported;
+    const pointer = try ctx.loadOp(allocator, code, rmw.ptr, .x16);
+    const operand = try ctx.loadOp(allocator, code, rmw.value, .x17);
+    const old: Reg = .x13;
+    const next: Reg = .x14;
+    const status: Reg = .x15;
+    const acquire = rmw.ordering == .acquire or rmw.ordering == .acq_rel or rmw.ordering == .seq_cst;
+    const release = rmw.ordering == .release or rmw.ordering == .acq_rel or rmw.ordering == .seq_cst;
+    if (rmw.ordering == .seq_cst) try code.append(allocator, 0xD5033BBF); // dmb ish
+    const loop = code.items.len;
+    try code.append(allocator, encode.ldxr(old, pointer, bits, acquire));
+    try code.append(allocator, if (rmw.op == .exchange)
+        (if (bits == 64) encode.add64(next, operand, .zr) else encode.add(next, operand, .zr))
+    else if (bits == 64)
+        encode.add64(next, old, operand)
+    else
+        encode.add(next, old, operand));
+    try code.append(allocator, encode.stxr(status, next, pointer, bits, release));
+    const retry = code.items.len;
+    try code.append(allocator, 0);
+    const back: i64 = -@as(i64, @intCast(retry - loop)) * 4;
+    code.items[retry] = encode.cbnz(status, @intCast(back));
+    if (rmw.ordering == .seq_cst) try code.append(allocator, 0xD5033BBF); // dmb ish
+    if (result) |value| {
+        const rd = ctx.resultReg(value);
+        if (rd != old) try code.append(allocator, if (bits == 64) encode.add64(rd, old, .zr) else encode.add(rd, old, .zr));
+        try storeResult(allocator, code, ctx, value, rd);
     }
 }
 
