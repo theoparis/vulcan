@@ -1,6 +1,6 @@
 //! The linker-script parser: turns GNU-ld-style linker-script text (a subset covering
-//! ENTRY, MEMORY, SECTIONS, the location counter, output sections and input wildcards,
-//! symbol assignments, ALIGN/ORIGIN/LENGTH, LMA/AT, and region assignment) into a typed,
+//! ENTRY, MEMORY, SECTIONS, NOLOAD and /DISCARD/, location counters, output sections,
+//! input wildcards, symbols, ALIGN/ORIGIN/LENGTH, LMA/AT, and region assignment into a typed,
 //! arena-backed `Script` AST. Pure text to AST: no layout, no linking, no dependency on
 //! `elf.zig`/`resolve.zig`/`arch/*` (this file imports only `std`, keeping `vulcan-link`
 //! std-only and this parser independently testable).
@@ -51,6 +51,10 @@ pub const Lma = union(enum) { addr: Expr, region: []const u8 };
 pub const SectionCmd = union(enum) { input: InputSpec, assign: Assign, set_dot: Expr };
 pub const OutputSection = struct {
     name: []const u8,
+    /// Discarded input sections are marked consumed but do not receive addresses.
+    discard: bool = false,
+    /// Sections in a NOLOAD output are memory-resident but omitted from file bytes.
+    no_load: bool = false,
     /// The optional address between the name and the `:`.
     vma: ?Expr,
     lma: ?Lma,
@@ -650,9 +654,15 @@ const Parser = struct {
         try self.bump();
     }
 
-    /// One statement inside `SECTIONS { }`: `. = expr ;` | `PROVIDE(...)` |
-    /// `ident = expr ;` | an output section (`ident` not followed by `=`).
+    /// `ident = expr ;` | an output section, or `/DISCARD/`.
     fn parseCommand(self: *Parser) ParseError!Command {
+        if (self.cur.kind == .slash) {
+            try self.bump();
+            const name = try self.expect(.ident, "expected DISCARD after '/'");
+            if (!std.mem.eql(u8, name.text, "DISCARD")) return self.fail("only /DISCARD/ is supported as a special output section");
+            _ = try self.expect(.slash, "expected closing '/' after DISCARD");
+            return Command{ .output = try self.parseOutputSectionBody("/DISCARD/") };
+        }
         if (self.cur.kind == .dot) {
             try self.bump();
             _ = try self.expect(.assign, "expected '=' after '.'");
@@ -681,8 +691,19 @@ const Parser = struct {
     /// `[vma_expr] : [AT( expr )] { section_cmd* } [> region] [AT> region]`.
     fn parseOutputSectionBody(self: *Parser, name_text: []const u8) ParseError!OutputSection {
         const name = try self.alloc.dupe(u8, name_text);
+        var no_load = false;
         var vma: ?Expr = null;
-        if (self.cur.kind != .colon) {
+        if (self.cur.kind == .lparen) {
+            try self.bump();
+            if (self.curIsIdent("NOLOAD")) {
+                try self.bump();
+                _ = try self.expect(.rparen, "expected ')' after NOLOAD");
+                no_load = true;
+            } else {
+                vma = try self.parseExpr();
+                _ = try self.expect(.rparen, "expected ')' after parenthesized output-section address");
+            }
+        } else if (self.cur.kind != .colon) {
             vma = try self.parseExpr();
         }
         _ = try self.expect(.colon, "expected ':' in output section");
@@ -717,7 +738,15 @@ const Parser = struct {
             lma = Lma{ .region = try self.alloc.dupe(u8, region_tok.text) };
         }
 
-        return OutputSection{ .name = name, .vma = vma, .lma = lma, .region = region, .body = try body.toOwnedSlice(self.alloc) };
+        return OutputSection{
+            .name = name,
+            .discard = std.mem.eql(u8, name_text, "/DISCARD/"),
+            .no_load = no_load,
+            .vma = vma,
+            .lma = lma,
+            .region = region,
+            .body = try body.toOwnedSlice(self.alloc),
+        };
     }
 
     /// One statement inside an output section's `{ }`: `. = expr ;` | `PROVIDE(...)` |
