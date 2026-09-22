@@ -356,6 +356,30 @@ pub fn ldrOff(rt: Reg, rn: Reg, off: u15) u32 {
     return 0xF9400000 | ((@as(u32, off) >> 3) << 10) | (n(rn) << 5) | n(rt);
 }
 
+/// `ldxr`/`ldaxr` for naturally aligned 8/16/32/64-bit exclusive loads.
+pub fn ldxr(rt: Reg, rn: Reg, bits: u16, acquire: bool) u32 {
+    const base: u32 = switch (bits) {
+        8 => 0x085F7C00,
+        16 => 0x485F7C00,
+        32 => 0x885F7C00,
+        64 => 0xC85F7C00,
+        else => unreachable,
+    };
+    return base | (if (acquire) @as(u32, 1) << 15 else 0) | (n(rn) << 5) | n(rt);
+}
+
+/// `stxr`/`stlxr` for naturally aligned 8/16/32/64-bit exclusive stores.
+pub fn stxr(status: Reg, rt: Reg, rn: Reg, bits: u16, release: bool) u32 {
+    const base: u32 = switch (bits) {
+        8 => 0x08007C00,
+        16 => 0x48007C00,
+        32 => 0x88007C00,
+        64 => 0xC8007C00,
+        else => unreachable,
+    };
+    return base | (if (release) @as(u32, 1) << 15 else 0) | (n(status) << 16) | (n(rn) << 5) | n(rt);
+}
+
 /// `prfm pldl1keep, [xn]` (prefetch hint, no architectural effect on results,
 /// only a microarchitectural hint to bring `[xn]` into L1). prfop = PLDL1KEEP
 /// (0b00000), imm12 = 0 (no offset): bits [31:22]=0b1111100110, [21:10]=imm12,

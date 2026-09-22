@@ -15,6 +15,7 @@ const isel = @import("isel.zig");
 const link = @import("link.zig");
 const dwarf = @import("../dwarf.zig");
 const object_emit = @import("../object_emit.zig");
+const elf_read = @import("../elf_read.zig");
 
 const Function = ir.function.Function;
 
@@ -261,7 +262,42 @@ fn dataSectionName(a: std.mem.Allocator, class: []const u8, name: []const u8) Er
 /// `R_AARCH64_ADR_PREL_PG_HI21`/`R_AARCH64_ADD_ABS_LO12_NC` pair. Both kinds of
 /// relocation target the referenced symbol, which is undefined if external. The shared
 /// `object_emit.emit` writes the ELF bytes. The caller owns the result.
+const Assembled = struct { text: []const u8, relocs: []elf_read.TextRelocation };
+
+fn assembleNaked(allocator: std.mem.Allocator, io: std.Io, source: []const u8) Error!Assembled {
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "llvm-mc", "-triple=aarch64", "-filetype=obj", "-o", "-", "-" },
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch return error.Unsupported;
+    defer child.kill(io);
+    const stdin = child.stdin orelse return error.Unsupported;
+    stdin.writeStreamingAll(io, source) catch return error.Unsupported;
+    stdin.close(io);
+    child.stdin = null;
+    const stdout = child.stdout orelse return error.Unsupported;
+    var stdout_reader = stdout.readerStreaming(io, &.{});
+    const object = stdout_reader.interface.allocRemaining(allocator, .limited(16 * 1024 * 1024)) catch return error.Unsupported;
+    defer allocator.free(object);
+    const stderr = child.stderr orelse return error.Unsupported;
+    var stderr_reader = stderr.readerStreaming(io, &.{});
+    const diagnostics = stderr_reader.interface.allocRemaining(allocator, .limited(1024 * 1024)) catch return error.Unsupported;
+    defer allocator.free(diagnostics);
+    const term = child.wait(io) catch return error.Unsupported;
+    if (term != .exited or term.exited != 0) return error.Unsupported;
+    const text_view = elf_read.findText(object) catch return error.Unsupported;
+    const text = allocator.dupe(u8, text_view.bytes) catch return error.OutOfMemory;
+    errdefer allocator.free(text);
+    const relocs = elf_read.textRelocations(allocator, object) catch return error.Unsupported;
+    for (relocs) |*r| r.symbol = allocator.dupe(u8, r.symbol) catch return error.OutOfMemory;
+    return .{ .text = text, .relocs = relocs };
+}
 pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Error![]u8 {
+    return writeModuleWithIo(allocator, module, null);
+}
+
+pub fn writeModuleWithIo(allocator: std.mem.Allocator, module: *const link.Module, io: ?std.Io) Error![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -273,7 +309,7 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Err
 
     // A text relocation recorded by its owning section and target name. Its target symbol
     // index resolves after every symbol is known.
-    const TextReloc = struct { sec: usize, offset: u64, name: []const u8, r_type: u32 };
+    const TextReloc = struct { sec: usize, offset: u64, name: []const u8, r_type: u32, addend: i64 = 0 };
     var text_relocs: std.ArrayList(TextReloc) = .empty;
     // A data pointer-init relocation, likewise resolved by name after every symbol exists.
     const DataR = struct { sec: usize, offset: u64, name: []const u8 };
@@ -281,13 +317,34 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Err
 
     const caps: isel.ModelCaps = if (module.model) |m| isel.capsForModel(m) else .{};
     for (module.functions.items) |entry| {
-        var compiled = try isel.compileFunction(allocator, entry.func, caps);
-        defer compiled.deinit(allocator);
-        const code = try a.alloc(u8, compiled.code.len * 4);
-        for (compiled.code, 0..) |word, wi| putInt(code[wi * 4 ..][0..4], u32, word);
         const sec_index = sections.items.len;
+        const code: []const u8 = if (entry.func.naked_asm) |source| blk: {
+            const process_io = io orelse return error.Unsupported;
+            const assembled = try assembleNaked(a, process_io, source);
+            for (assembled.relocs) |r| try text_relocs.append(a, .{
+                .sec = sec_index,
+                .offset = r.offset,
+                .name = r.symbol,
+                .r_type = r.r_type,
+                .addend = r.addend,
+            });
+            break :blk assembled.text;
+        } else blk: {
+            var compiled = try isel.compileFunction(allocator, entry.func, caps);
+            defer compiled.deinit(allocator);
+            const bytes = try a.alloc(u8, compiled.code.len * 4);
+            for (compiled.code, 0..) |word, wi| putInt(bytes[wi * 4 ..][0..4], u32, word);
+            for (compiled.relocs) |r| try text_relocs.append(a, .{
+                .sec = sec_index,
+                .offset = @as(u64, r.offset) * 4,
+                .name = r.symbol,
+                .r_type = @intFromEnum(relocTypeOf(r.kind)),
+            });
+            break :blk bytes;
+        };
+        const section_name = entry.func.link_section orelse try std.fmt.allocPrint(a, ".text.{s}", .{entry.name});
         try sections.append(a, .{
-            .name = try std.fmt.allocPrint(a, ".text.{s}", .{entry.name}),
+            .name = section_name,
             .sh_type = SHT_PROGBITS,
             .flags = SHF_ALLOC | SHF_EXECINSTR,
             .bytes = code,
@@ -295,13 +352,8 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Err
             .addralign = 4,
         });
         try reloc_lists.append(a, .empty);
-        // A `static` function has internal linkage. So does a `.`-prefixed compiler-local
-        // name. Both get LOCAL binding.
         const binding: object_emit.Binding = if (entry.func.is_local or std.mem.startsWith(u8, entry.name, ".")) .local else .global;
         try symbols.append(a, .{ .name = entry.name, .section = @intCast(sec_index), .value = 0, .size = code.len, .binding = binding, .sym_type = .func, .defined = true });
-        // Rebase each relocation section-relative. Its offset was a word index into this
-        // function's own code, so multiply by 4.
-        for (compiled.relocs) |r| try text_relocs.append(a, .{ .sec = sec_index, .offset = @as(u64, r.offset) * 4, .name = r.symbol, .r_type = @intFromEnum(relocTypeOf(r.kind)) });
     }
 
     // One section per data global.
@@ -333,7 +385,7 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Err
     // this symbol list. The emitter remaps it after its own symbol sort.
     for (text_relocs.items) |p| {
         const sym = oeIndex(symbols.items, p.name).?;
-        try reloc_lists.items[p.sec].append(a, .{ .offset = p.offset, .symbol = sym, .r_type = p.r_type });
+        try reloc_lists.items[p.sec].append(a, .{ .offset = p.offset, .symbol = sym, .r_type = p.r_type, .addend = p.addend });
     }
     // Resolve every data pointer-init relocation. Its target is an internally defined
     // global. It is an error if the target is missing.
