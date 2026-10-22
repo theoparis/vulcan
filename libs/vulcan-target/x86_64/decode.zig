@@ -115,12 +115,12 @@ pub const Imm = struct {
     /// The value as the processor sees it, sign- or zero-extended to 64 bits.
     pub fn extended(self: Imm) u64 {
         if (!self.sign_extended) return self.value;
-        return switch (self.bits) {
-            8 => @as(u64, @bitCast(@as(i8, @truncate(self.value)))),
-            16 => @as(u64, @bitCast(@as(i16, @truncate(self.value)))),
-            32 => @as(u64, @bitCast(@as(i32, @truncate(self.value)))),
-            else => self.value,
-        };
+        const bits = self.bits;
+        const raw = self.value;
+        if (bits == 8) return @bitCast(@as(i64, @as(i8, @bitCast(@as(u8, @truncate(raw))))));
+        if (bits == 16) return @bitCast(@as(i64, @as(i16, @bitCast(@as(u16, @truncate(raw))))));
+        if (bits == 32) return @bitCast(@as(i64, @as(i32, @bitCast(@as(u32, @truncate(raw))))));
+        return raw;
     }
 };
 
@@ -248,6 +248,14 @@ pub const Instruction = union(enum) {
     /// An opcode the decoder does not model: the raw bytes, so a disassembler can print
     /// them and a consumer can refuse the instruction.
     unknown: struct { bytes: [4]u8, len: u3 },
+
+    /// True when the instruction ends a block: it hands control somewhere else.
+    pub fn terminates(self: Instruction) bool {
+        return switch (self) {
+            .ret, .jmp, .jcc, .call, .hlt, .syscall => true,
+            else => false,
+        };
+    }
 };
 
 /// A decoded instruction and its length in bytes.
