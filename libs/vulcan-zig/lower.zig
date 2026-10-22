@@ -2684,14 +2684,9 @@ fn toI64(l: *L, tv: TypedValue) Error!Value {
 fn convertTo(l: *L, tv: TypedValue, target: ZType) Error!TypedValue {
     if (tv.zty.eql(target)) return tv;
     if (target == .enumeration) {
-        // A named enum tag may be assigned from another enum with the same backing
-        // shape (implicit literals stay nominal via `lowerEnumLiteral`), but never from
-        // a plain integer without an explicit cast.
-        if (tv.zty != .enumeration) return Error.TypeMismatch;
-        if (!comptimeCoerces(ZType{ .int = tv.zty.enumeration.backing }, ZType{ .int = target.enumeration.backing })) return Error.TypeMismatch;
-        const irty = try target.irType(l.func);
-        const value = try l.func.appendInst(l.block, irty, .{ .convert = .{ .value = tv.value } });
-        return .{ .value = value, .zty = target };
+        // Enums are nominal: a value of one enum never becomes another, even when the
+        // backings match. \`@enumFromInt\` is the explicit conversion.
+        return Error.TypeMismatch;
     }
     if (tv.zty == .enumeration and target == .int) return Error.TypeMismatch;
     switch (tv.zty) {

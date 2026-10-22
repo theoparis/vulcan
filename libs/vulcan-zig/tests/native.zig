@@ -1393,3 +1393,39 @@ fn findTest(mod: *const zigc.Module, name: []const u8) ?usize {
     }
     return null;
 }
+
+test "enums: sequential and explicit tags, backing width, and nominal identity" {
+    const a = std.testing.allocator;
+    var mod = try zigc.compile(a,
+        \\const Wide = enum(usize) { nothing = 0, all = 0xffffffffffffffff, _ };
+        \\const Narrow = enum(u8) { first = 5, second };
+        \\fn wide(choice: Wide) usize { return @intFromEnum(choice); }
+        \\fn narrow() u8 { const v: Narrow = .second; return @intFromEnum(v); }
+        \\fn roundTrip() usize { return wide(Wide.all); }
+    );
+    defer mod.deinit(a);
+    var wide = try jitFn(a, &mod, "wide", *const fn (usize) callconv(.c) usize);
+    defer wide.j.deinit();
+    var narrow = try jitFn(a, &mod, "narrow", *const fn () callconv(.c) u8);
+    defer narrow.j.deinit();
+    var round_trip = try jitFn(a, &mod, "roundTrip", *const fn () callconv(.c) usize);
+    defer round_trip.j.deinit();
+    try std.testing.expectEqual(@as(usize, 7), wide.f(7));
+    try std.testing.expectEqual(@as(u8, 6), narrow.f());
+    try std.testing.expectEqual(std.math.maxInt(usize), round_trip.f());
+}
+
+test "enums: two nominal types with the same backing do not interchange" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(zigc.Error.TypeMismatch, zigc.compile(a,
+        \\const Left = enum(u8) { a, b };
+        \\const Right = enum(u8) { a, b };
+        \\fn f(value: Left) u8 { const other: Right = value; return @intFromEnum(other); }
+    ));
+    try std.testing.expectError(zigc.Error.IntegerOverflow, zigc.compile(a,
+        \\fn f() u8 { return @intFromEnum(@as(enum(u8) { a = 300 }, .a)); }
+    ));
+    try std.testing.expectError(zigc.Error.DuplicateDecl, zigc.compile(a,
+        \\fn f() u8 { return @intFromEnum(@as(enum(u8) { a = 3, b = 3 }, .a)); }
+    ));
+}
