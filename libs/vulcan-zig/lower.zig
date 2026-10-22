@@ -338,6 +338,7 @@ test "optional integer calls preserve null, payload, and adjacent stack slots" {
 // SSA value's type or an `alloca`'s storage-sizing element type.
 // ---------------------------------------------------------------------------------------
 
+const ZInt = struct { signed: bool, bits: u16 };
 const ZErrorSet = struct { names: []const []const u8 };
 const ZErrorUnion = struct { payload: *const ZType, errors: *const ZErrorSet };
 
@@ -363,12 +364,13 @@ const ZType = union(enum) {
     slice: *const ZType,
     array: ZArray,
     strct: *const StructDef,
+    /// Nominal: `ZType.enumeration` carries its identity, never just the backing width.
+    enumeration: *const EnumDef,
     /// A `@cVaStart()`-initialized `va_list` object. Backend-opaque: this frontend never reads
     /// or writes its bytes itself (`ir.function.Opcode.va_start`/`va_arg`/`va_end` do, at
     /// fixed per-target offsets (AAPCS64 needs 32 bytes), only needs a slot it can address,
     /// exactly like any other local. See `lowerStmt`'s `@cVaStart()` var-decl special case.
     va_list,
-    const ZInt = struct { signed: bool, bits: u16 };
     const ZArray = struct { len: u64, elem: *const ZType };
 
     fn isAggregate(self: ZType) bool {
@@ -390,6 +392,7 @@ const ZType = union(enum) {
             .error_void => 2,
             .boolean, .opaque_type => 1,
             .int, .float => self.byteSize(),
+            .enumeration => |e| enumByteSize(e.backing),
             .ptr, .optional_ptr, .slice, .va_list => 8,
             .error_set => 2,
             .error_union => |e| @max(e.payload.alignment(), 2),
@@ -406,6 +409,7 @@ const ZType = union(enum) {
             .error_void, .error_set => 2,
             .boolean => 1,
             .int => |i| (@as(u64, i.bits) + 7) / 8,
+            .enumeration => |e| enumByteSize(e.backing),
             .opaque_type => 0,
             .float => |f| switch (f) {
                 .f16 => 2,
@@ -438,6 +442,7 @@ const ZType = union(enum) {
             .boolean => func.types.intern(.bool),
             .opaque_type => unreachable, // Zig never materializes an anyopaque value.
             .int => |i| func.types.intern(.{ .int = .{ .signedness = if (i.signed) .signed else .unsigned, .bits = i.bits } }),
+            .enumeration => |e| func.types.intern(.{ .int = .{ .signedness = if (e.backing.signed) .signed else .unsigned, .bits = e.backing.bits } }),
             .float => |f| func.types.intern(.{ .float = f }),
             .ptr, .optional_ptr => func.types.ptrGlobal(),
             .slice => blk: {
@@ -486,6 +491,7 @@ const ZType = union(enum) {
             .slice => |ap| ap.eql(b.slice.*),
             .array => |aa| aa.len == b.array.len and aa.elem.eql(b.array.elem.*),
             .strct => |as_| as_ == b.strct,
+            .enumeration => |ae| ae == b.enumeration,
             .error_set => |ae| errorSetsEqual(ae.*, b.error_set.*),
             .error_union => |ae| ae.payload.eql(b.error_union.payload.*) and errorSetsEqual(ae.errors.*, b.error_union.errors.*),
             .va_list => true,
@@ -495,11 +501,54 @@ const ZType = union(enum) {
 
 const StructField = struct { name: []const u8, ty: ZType, offset: u64 };
 const StructDef = struct { name: []const u8, fields: []const StructField, byte_size: u64, alignment: u64 };
+/// One named enumeration tag. Tags are stored as `EnumDef.backing`; an enum value is a
+/// nominal type, so two enums with the same backing width do not interchange.
+const EnumField = struct { name: []const u8, value: u64 };
+const EnumDef = struct {
+    name: []const u8,
+    /// The integral backing type. Only integer widths are modeled.
+    backing: ZInt,
+    fields: []const EnumField,
+    /// A trailing `_` tag makes the enum non-exhaustive: a value outside `fields` is
+    /// still a valid enum, only its name is not known at compile time.
+    non_exhaustive: bool,
+
+    fn field(self: *const EnumDef, name: []const u8) ?EnumField {
+        if (std.mem.eql(u8, name, "_")) return null;
+        for (self.fields) |f| if (std.mem.eql(u8, f.name, name)) return f;
+        return null;
+    }
+
+    /// Does any named tag hold `value`?
+    fn hasValue(self: *const EnumDef, value: u64) bool {
+        for (self.fields) |f| if (f.value == value) return true;
+        return false;
+    }
+};
+/// A top-level `const` whose value was evaluated, with the type it evaluated at.
+const ConstEntry = struct { zty: ZType, value: ConstValue };
 const GlobalDef = struct { zty: ZType, symbol: []const u8 };
+fn enumByteSize(backing: ZInt) u64 {
+    return (@as(u64, backing.bits) + 7) / 8;
+}
 const FnDeclInfo = struct { decl_node: Ast.Node.Index, proto_node: Ast.Node.Index, body_node: ?Ast.Node.Index };
 const GlobalDeclInfo = struct { decl_node: Ast.Node.Index };
+/// A named container (struct or enum): its declaring node and, when it is a `fn`
+/// declaration's member of a container, `parent` is that container node.
+const TypeDeclInfo = struct { decl_node: Ast.Node.Index, parent: ?Ast.Node.Index = null };
 const DeclKey = struct { tree: *const Ast, node: Ast.Node.Index };
-const ConstValue = union(enum) { boolean: bool, int: i64 };
+const ConstValue = union(enum) {
+    boolean: bool,
+    /// The integer's bit pattern; its width and signedness come from the expression that
+    /// produced it (`EvalValue.zty`), because Zig integers are typed rather than `i64`.
+    int: i64,
+};
+/// A comptime value with the type it was evaluated at.
+const EvalValue = struct { zty: ZType, value: ConstValue };
+/// Evaluation answer plus whether the expression depended on a runtime value (an enum
+/// literal without an expected type, or a non-comptime parameter). A dependent result may
+/// be used for its type, but never folded into data or a constant.
+const Eval = struct { value: EvalValue, dependent: bool = false };
 const ConstBinding = struct { name: []const u8, value: i64 };
 
 fn errorSetsEqual(a: ZErrorSet, b: ZErrorSet) bool {
@@ -684,14 +733,20 @@ const Ctx = struct {
     defs: std.StringHashMapUnmanaged(*const StructDef) = .empty,
     resolving: std.StringHashMapUnmanaged(void) = .empty,
     globals: std.StringHashMapUnmanaged(GlobalDef) = .empty,
-    constants: std.StringHashMapUnmanaged(ConstValue) = .empty,
+    constants: std.StringHashMapUnmanaged(ConstEntry) = .empty,
     deferred_constants: std.StringHashMapUnmanaged(Ast.Node.Index) = .empty,
     compiler: *Compiler,
     is_root: bool = false,
     function_decls: std.StringHashMapUnmanaged(FnDeclInfo) = .empty,
+    /// Every enum or struct container named by a top-level declaration, including those
+    /// reached through a qualified name in another file.
+    type_decls: std.StringHashMapUnmanaged(TypeDeclInfo) = .empty,
     global_decls: std.StringHashMapUnmanaged(GlobalDeclInfo) = .empty,
     literal_data: std.ArrayList(Data) = .empty,
     inferred_error_names: std.ArrayList([]const u8) = .empty,
+    /// Local `const Name = enum/struct {...}` type declarations of the function being
+    /// lowered, by name. Cleared per function.
+    local_types: std.StringHashMapUnmanaged(ZType) = .empty,
 
     fn addInferredError(self: *Ctx, name: []const u8) Error!void {
         for (self.inferred_error_names.items) |existing| {
@@ -762,6 +817,10 @@ const Compiler = struct {
     foreign_defs: std.AutoHashMapUnmanaged(ForeignKey, *const StructDef) = .empty,
     foreign_resolving: std.AutoHashMapUnmanaged(ForeignKey, void) = .empty,
     functions: std.AutoHashMapUnmanaged(DeclKey, FunctionEntry) = .empty,
+    /// Canonical enum definitions, keyed by the defining container in its own tree, so
+    /// every module instance and imported reference agrees on tags and identity.
+    enum_defs: std.AutoHashMapUnmanaged(ForeignKey, *const EnumDef) = .empty,
+    enum_resolving: std.AutoHashMapUnmanaged(ForeignKey, void) = .empty,
     function_queue: std.ArrayList(DeclKey) = .empty,
     data: std.ArrayList(Data) = .empty,
     next_link_id: u64 = 0,
@@ -810,8 +869,11 @@ const Compiler = struct {
                 if (vd.ast.init_node.unwrap()) |init_node| {
                     var container_buf: [2]Ast.Node.Index = undefined;
                     if (tree.fullContainerDecl(&container_buf, init_node)) |container| {
-                        if (tree.tokenTag(container.ast.main_token) == .keyword_struct)
-                            try ctx.nodes.put(self.arena, name, init_node);
+                        switch (tree.tokenTag(container.ast.main_token)) {
+                            .keyword_struct => try ctx.nodes.put(self.arena, name, init_node),
+                            .keyword_enum => try ctx.type_decls.put(self.arena, name, .{ .decl_node = init_node }),
+                            else => {},
+                        }
                         continue;
                     }
                     if (tree.tokenTag(vd.ast.mut_token) == .keyword_const and vd.ast.type_node.unwrap() == null)
@@ -958,6 +1020,19 @@ fn resolveForeignStruct(ctx: *Ctx, tree: *const Ast, dir: []const u8, node: Ast.
     var offset: u64 = 0;
     var alignment: u64 = 1;
     for (cd.ast.members) |member| {
+        if (tree.fullVarDecl(member)) |vd| {
+            const name = tree.tokenSlice(vd.ast.mut_token + 1);
+            if (vd.ast.init_node.unwrap()) |member_init| {
+                if (tree.fullContainerDecl(undefined, member_init)) |inner| {
+                    switch (tree.tokenTag(inner.ast.main_token)) {
+                        .keyword_struct, .keyword_enum => try ctx.type_decls.put(ctx.arena, name, .{ .decl_node = member_init, .parent = node }),
+                        else => {},
+                    }
+                }
+            }
+            continue;
+        }
+        if (tree.fullFnProto(undefined, member) != null) continue;
         const cf = tree.fullContainerField(member) orelse continue;
         const te = cf.ast.type_expr.unwrap() orelse return Error.UnsupportedType;
         const fty = try resolveTypeIn(ctx, tree, dir, te);
@@ -984,9 +1059,92 @@ fn resolveContainerTypeIn(ctx: *Ctx, tree: *const Ast, dir: []const u8, node: As
     const decl = tree.fullContainerDecl(&buf, node) orelse return Error.UnsupportedType;
     return switch (tree.tokenTag(decl.ast.main_token)) {
         .keyword_opaque => .opaque_type,
+        .keyword_enum => ZType{ .enumeration = try resolveEnum(ctx, tree, dir, node, decl) },
         .keyword_struct => ZType{ .strct = try resolveForeignStruct(ctx, tree, dir, node) },
         else => Error.UnsupportedType,
     };
+}
+
+/// Resolve a container that names an enum, or `null` when it names something else.
+/// Used by the constant evaluator, which reaches an enum through `Enum.field` without
+/// knowing the container's kind.
+fn resolveEnumTypeIn(ctx: *Ctx, tree: *const Ast, dir: []const u8, node: Ast.Node.Index) ?ZType {
+    var buf: [2]Ast.Node.Index = undefined;
+    const decl = tree.fullContainerDecl(&buf, node) orelse return null;
+    if (tree.tokenTag(decl.ast.main_token) != .keyword_enum) return null;
+    return ZType{ .enumeration = resolveEnum(ctx, tree, dir, node, decl) catch return null };
+}
+
+/// Build (once per defining container) the named-tag table of an enum declaration.
+/// Tags keep declaration order and each value is the previous value plus one unless the
+/// field names one explicitly. The backing type defaults to `isize`/`i32`, and a trailing
+/// `_` makes the enum non-exhaustive.
+fn resolveEnum(ctx: *Ctx, tree: *const Ast, dir: []const u8, node: Ast.Node.Index, decl: Ast.full.ContainerDecl) Error!*const EnumDef {
+    const key = ForeignKey{ .tree = tree, .node = node };
+    if (ctx.compiler.enum_defs.get(key)) |def| return def;
+    if (ctx.compiler.enum_resolving.contains(key)) return Error.UnsupportedType;
+    try ctx.compiler.enum_resolving.put(ctx.arena, key, {});
+
+    const backing: ZInt = if (decl.ast.arg.unwrap()) |arg_node| blk: {
+        const ty = try resolveTypeIn(ctx, tree, dir, arg_node);
+        if (ty != .int) return Error.UnsupportedType;
+        if (ty.int.bits == 0 or ty.int.bits > 64) return Error.UnsupportedType;
+        break :blk ty.int;
+    } else .{ .signed = true, .bits = if (ctx.target == .x86) 32 else 64 };
+
+    var tags: std.ArrayList(EnumField) = .empty;
+    var next: ?u64 = null;
+    var non_exhaustive = false;
+    for (decl.ast.members) |member| {
+        const cf = tree.fullContainerField(member) orelse continue;
+        const name = tree.tokenSlice(cf.ast.main_token);
+        if (std.mem.eql(u8, name, "_")) {
+            if (cf.ast.value_expr.unwrap() != null) return Error.UnsupportedNode;
+            non_exhaustive = true;
+            continue;
+        }
+        const value: u64 = if (cf.ast.value_expr.unwrap()) |value_node| blk: {
+            const evaluated = evalInt(ctx, tree, value_node, &.{}, 0, null) orelse return Error.UnsupportedType;
+            if (evaluated.zty != .int and evaluated.zty != .enumeration) return Error.UnsupportedType;
+            break :blk @bitCast(evaluated.value.int);
+        } else next orelse 0;
+        if (!enumValueFits(backing, value)) return Error.IntegerOverflow;
+        for (tags.items) |existing| {
+            const width: u6 = @intCast(@max(backing.bits, 1) - 1);
+            const mask: u64 = if (backing.bits >= 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(backing.bits)) - 1;
+            _ = width;
+            if ((existing.value & mask) == (value & mask)) return Error.DuplicateDecl;
+        }
+        try tags.append(ctx.arena, .{ .name = name, .value = value });
+        next = if (value == std.math.maxInt(u64)) null else value + 1;
+    }
+    if (tags.items.len == 0 and !non_exhaustive) {
+        // A zero-tag enum has no valid value in Zig; it cannot be stored here.
+        return Error.UnsupportedType;
+    }
+    if (tags.items.len != 0 and !non_exhaustive and next == null) return Error.IntegerOverflow;
+
+    const def = try ctx.arena.create(EnumDef);
+    def.* = .{
+        .name = "",
+        .backing = backing,
+        .fields = try tags.toOwnedSlice(ctx.arena),
+        .non_exhaustive = non_exhaustive,
+    };
+    try ctx.compiler.enum_defs.put(ctx.arena, key, def);
+    _ = ctx.compiler.enum_resolving.remove(key);
+    return def;
+}
+
+fn enumValueFits(backing: ZInt, value: u64) bool {
+    if (backing.bits >= 64) return true;
+    if (backing.signed) {
+        const sign_bit: u64 = @as(u64, 1) << @intCast(backing.bits - 1);
+        const mask: u64 = (@as(u64, 1) << @intCast(backing.bits)) - 1;
+        _ = sign_bit;
+        return value & ~mask == 0;
+    }
+    return value >> @intCast(backing.bits) == 0;
 }
 
 /// Resolve a type expression node to a `ZType`: `bool`, `void` is NEVER valid here (callers
@@ -1018,10 +1176,21 @@ fn resolveTypeIn(ctx: *Ctx, tree: *const Ast, dir: []const u8, node: Ast.Node.In
             // forward-reference tolerant); any OTHER file's local identifier is looked up
             // fresh and built via the general foreign-struct path instead.
             if (tree == ctx.tree and ctx.nodes.contains(name)) return ZType{ .strct = try ctx.resolve(name) };
+            if (tree == ctx.tree) {
+                if (ctx.local_types.get(name)) |zty| return zty;
+            }
+            if (tree == ctx.tree) {
+                if (ctx.type_decls.contains(name)) {
+                    const local = try ctx.compiler.contextFor(tree);
+                    if (local.type_decls.get(name)) |local_decl| {
+                        if (resolveEnumTypeIn(local, tree, ctx.dir, local_decl.decl_node)) |zty| return zty;
+                    }
+                }
+            }
             const resolved = try resolveQualifiedName(ctx, tree, dir, node);
             if (resolved.node) |decl| {
                 return switch (resolved.tree.nodeTag(decl)) {
-                    .container_decl, .container_decl_trailing, .container_decl_two, .container_decl_two_trailing => ZType{ .strct = try resolveForeignStruct(ctx, resolved.tree, resolved.dir, decl) },
+                    .container_decl, .container_decl_trailing, .container_decl_two, .container_decl_two_trailing, .container_decl_arg, .container_decl_arg_trailing => try resolveContainerTypeIn(ctx, resolved.tree, resolved.dir, decl),
                     else => try resolveTypeIn(ctx, resolved.tree, resolved.dir, decl),
                 };
             }
@@ -1084,13 +1253,13 @@ fn resolveTypeIn(ctx: *Ctx, tree: *const Ast, dir: []const u8, node: Ast.Node.In
             const resolved = try resolveQualifiedName(ctx, tree, dir, node);
             if (resolved.node) |decl| {
                 return switch (resolved.tree.nodeTag(decl)) {
-                    .container_decl, .container_decl_trailing, .container_decl_two, .container_decl_two_trailing => try resolveContainerTypeIn(ctx, resolved.tree, resolved.dir, decl),
+                    .container_decl, .container_decl_trailing, .container_decl_two, .container_decl_two_trailing, .container_decl_arg, .container_decl_arg_trailing => try resolveContainerTypeIn(ctx, resolved.tree, resolved.dir, decl),
                     else => try resolveTypeIn(ctx, resolved.tree, resolved.dir, decl),
                 };
             }
             return ZType{ .strct = try resolveForeignStruct(ctx, resolved.tree, resolved.dir, .root) };
         },
-        .container_decl, .container_decl_trailing, .container_decl_two, .container_decl_two_trailing => return resolveContainerTypeIn(ctx, tree, dir, node),
+        .container_decl, .container_decl_trailing, .container_decl_two, .container_decl_two_trailing, .container_decl_arg, .container_decl_arg_trailing => return resolveContainerTypeIn(ctx, tree, dir, node),
         else => return Error.UnsupportedType,
     }
 }
@@ -1188,7 +1357,7 @@ fn evalUnsignedIntegerExpr(tree: *const Ast, node: Ast.Node.Index, depth: u8) ?u
     }
 }
 
-fn integerLiteralBits(tree: *const Ast, node: Ast.Node.Index, zint: ZType.ZInt) Error!struct { bits: u64, negative: bool } {
+fn integerLiteralBits(tree: *const Ast, node: Ast.Node.Index, zint: ZInt) Error!struct { bits: u64, negative: bool } {
     const tag = tree.nodeTag(node);
     const expr = if (tag == .negation) tree.nodeData(node).node else node;
     const magnitude = evalUnsignedIntegerExpr(tree, expr, 0) orelse return Error.UnsupportedNode;
@@ -1404,7 +1573,7 @@ fn ensureGlobal(ctx: *Ctx, name: []const u8) Error!?GlobalDef {
     if (is_extern) return global;
     const init = init_node orelse return Error.UnsupportedNode;
     const constant = evalTopConst(ctx, init);
-    const data = try lowerGlobalData(ctx.compiler.gpa, tree, symbol, zty, is_const, init, constant);
+    const data = try lowerGlobalData(ctx.compiler.gpa, tree, symbol, zty, is_const, init, if (constant) |entry| entry.value else null);
     errdefer {
         ctx.compiler.gpa.free(data.name);
         ctx.compiler.gpa.free(data.bytes);
@@ -1522,6 +1691,65 @@ fn encodeUtf16LiteralGlobal(gpa: std.mem.Allocator, arena: std.mem.Allocator, tr
     return .{ .zty = ZType{ .array = .{ .len = len + 1, .elem = elem } }, .bytes = bytes };
 }
 
+/// A top-level `const` visible from the current file. The root file keeps its own
+/// evaluated table; another file's constant is evaluated in that file's context.
+fn localConstEntry(l: *L, name: []const u8) Error!?ConstEntry {
+    if (l.r.constants.get(name)) |entry| return entry;
+    if (!l.r.deferred_constants.contains(name)) return null;
+    const init = l.r.deferred_constants.get(name).?;
+    const value = evalInt(l.r, l.r.tree, init, &.{}, 0, null) orelse return null;
+    return .{ .zty = value.zty, .value = value.value };
+}
+
+/// Materialize an evaluated constant at the type the use site needs. Booleans and
+/// integers convert; enum tags keep their nominal type unless coerced to another enum
+/// with an equal-shaped backing.
+fn constEntryValue(l: *L, entry: ConstEntry, expected: ?ZType) Error!TypedValue {
+    if (expected) |zty| {
+        if (zty == .enumeration) {
+            const value = entry.value.int;
+            if (!entry.zty.eql(zty)) {
+                if (!comptimeCoerces(enumBackingOf(entry.zty), ZType{ .int = zty.enumeration.backing })) return Error.TypeMismatch;
+                if (!zty.enumeration.non_exhaustive and !zty.enumeration.hasValue(@bitCast(value))) return Error.TypeMismatch;
+            }
+            const irty = try zty.irType(l.func);
+            return .{ .value = try l.func.appendInst(l.block, irty, .{ .iconst = value }), .zty = zty };
+        }
+        if (zty != .int and zty != .boolean) return Error.TypeMismatch;
+    }
+    switch (entry.value) {
+        .boolean => |value| return .{ .value = try l.func.appendInst(l.block, try boolType(l.func), .{ .iconst = @intFromBool(value) }), .zty = .boolean },
+        .int => |value| {
+            const zty = expected orelse entry.zty;
+            if (zty != .int) return Error.TypeMismatch;
+            if (!fitsInt(zty, value)) return Error.IntegerOverflow;
+            return .{ .value = try l.func.appendInst(l.block, try zty.irType(l.func), .{ .iconst = value }), .zty = zty };
+        },
+    }
+}
+
+fn lowerEnumLiteral(l: *L, node: Ast.Node.Index, expected: ?ZType) Error!TypedValue {
+    const zty = expected orelse return Error.TypeMismatch;
+    const def = switch (zty) {
+        .enumeration => |d| d,
+        else => return Error.TypeMismatch,
+    };
+    const entry = def.field(l.r.tree.tokenSlice(l.r.tree.nodeMainToken(node))) orelse return Error.TypeMismatch;
+    return .{ .value = try l.func.appendInst(l.block, try zty.irType(l.func), .{ .iconst = std.math.cast(i64, entry.value) orelse @as(i64, @bitCast(entry.value)) }), .zty = zty };
+}
+
+fn enumLike(zty: ZType) bool {
+    return zty == .enumeration or zty == .int;
+}
+
+fn enumBackingOf(zty: ZType) ZType {
+    return switch (zty) {
+        .enumeration => |e| ZType{ .int = e.backing },
+        .int => zty,
+        else => unreachable,
+    };
+}
+
 fn evalBuiltinArchEqual(ctx: *const Ctx, node: Ast.Node.Index) ?bool {
     if (ctx.tree.nodeTag(node) != .equal_equal) return null;
     const operands = ctx.tree.nodeData(node).node_and_node;
@@ -1532,63 +1760,141 @@ fn evalBuiltinArchEqual(ctx: *const Ctx, node: Ast.Node.Index) ?bool {
 }
 
 fn evalConstInt(ctx: *Ctx, tree: *const Ast, node: Ast.Node.Index, bindings: []const ConstBinding, depth: u8) ?i64 {
+    const result = evalTypedInt(ctx, tree, node, bindings, depth) orelse return null;
+    return result.value.int;
+}
+
+/// Evaluate an integer expression at its native comptime type. `Enum(usize)` tags and
+/// `usize` limits stay unsigned; nothing is silently reinterpreted as `i64`.
+fn evalTypedInt(ctx: *Ctx, tree: *const Ast, node: Ast.Node.Index, bindings: []const ConstBinding, depth: u8) ?EvalValue {
+    return evalInt(ctx, tree, node, bindings, depth, null);
+}
+
+/// Evaluate a typed comptime integer expression. `expected` supplies the type of an
+/// untyped literal or enum literal; without one a number keeps its literal value and the
+/// evaluator cannot resolve enum fields. Results always carry a real type so `usize`
+/// limits and enum backings are never reinterpreted as `i64`.
+fn evalInt(
+    ctx: *Ctx,
+    tree: *const Ast,
+    node: Ast.Node.Index,
+    bindings: []const ConstBinding,
+    depth: u8,
+    expected: ?ZType,
+) ?EvalValue {
     if (depth == 32) return null;
     switch (tree.nodeTag(node)) {
-        .number_literal => return switch (std.zig.number_literal.parseNumberLiteral(tree.tokenSlice(tree.nodeMainToken(node)))) {
-            .int => |value| @bitCast(value),
-            else => null,
+        .number_literal => {
+            const zty = expected orelse ZType{ .int = .{ .signed = true, .bits = 64 } };
+            const value: i64 = switch (std.zig.number_literal.parseNumberLiteral(tree.tokenSlice(tree.nodeMainToken(node)))) {
+                .int => |bits| @bitCast(bits),
+                else => return null,
+            };
+            if (!fitsInt(zty, value)) return null;
+            return .{ .zty = zty, .value = .{ .int = value } };
         },
         .identifier => {
             const name = tree.tokenSlice(tree.nodeMainToken(node));
             for (bindings) |binding| {
-                if (std.mem.eql(u8, binding.name, name)) return binding.value;
+                if (std.mem.eql(u8, binding.name, name)) return .{ .zty = expected orelse ZType{ .int = .{ .signed = true, .bits = 64 } }, .value = .{ .int = binding.value } };
             }
             if (tree == ctx.tree) {
-                if (ctx.constants.get(name)) |value| switch (value) {
-                    .int => |integer| return integer,
-                    .boolean => {},
-                };
+                if (ctx.constants.get(name)) |value| {
+                    const zty = expected orelse value.zty;
+                    if (!zty.eql(value.zty) and !comptimeCoerces(value.zty, zty)) return null;
+                    return .{ .zty = zty, .value = value.value };
+                }
+                // A constant declared later in this file: evaluate it here instead of
+                // requiring the caller to have registered it already.
+                if (findRootConstInit(tree, name)) |init| {
+                    const found = evalInt(ctx, tree, init, &.{}, depth + 1, expected) orelse return null;
+                    return found;
+                }
             }
             const global = findRootGlobalType(tree, name) orelse return null;
             if (!global.is_const) return null;
             const init = global.init_node orelse return null;
-            return evalConstInt(ctx, tree, init, &.{}, depth + 1);
+            const body = evalInt(ctx, tree, init, &.{}, depth + 1, null) orelse return null;
+            if (global.type_node) |type_node| {
+                const declared = resolveTypeIn(ctx, tree, ownerDir(ctx, tree), type_node) catch return null;
+                if (!declared.eql(body.zty) and !comptimeCoerces(body.zty, declared)) return null;
+                return .{ .zty = declared, .value = body.value };
+            }
+            return body;
         },
         .field_access => {
             const access = tree.nodeData(node).node_and_token;
-            const dir = if (ctx.tree == tree)
-                ctx.dir
-            else if (ctx.modules) |modules|
-                (modules.owner(tree) orelse return null).dir
-            else
-                return null;
+            const dir = ownerDir(ctx, tree);
             const resolved = resolveQualifiedName(ctx, tree, dir, access[0]) catch return null;
-            if (resolved.node != null) return null;
-            const global = findRootGlobalType(resolved.tree, tree.tokenSlice(access[1])) orelse return null;
+            const field_name = tree.tokenSlice(access[1]);
+            if (resolved.node) |container| {
+                const zty = resolveEnumTypeIn(ctx, resolved.tree, resolved.dir, container) orelse return null;
+                const entry = zty.enumeration.field(field_name) orelse return null;
+                return .{ .zty = zty, .value = .{ .int = @bitCast(entry.value) } };
+            }
+            const global = findRootGlobalType(resolved.tree, field_name) orelse return null;
             if (!global.is_const) return null;
             const init = global.init_node orelse return null;
-            return evalConstInt(ctx, resolved.tree, init, &.{}, depth + 1);
+            const body = evalInt(ctx, resolved.tree, init, &.{}, depth + 1, null) orelse return null;
+            if (global.type_node) |type_node| {
+                const declared = resolveTypeIn(ctx, resolved.tree, resolved.dir, type_node) catch return null;
+                if (!declared.eql(body.zty) and !comptimeCoerces(body.zty, declared)) return null;
+                return .{ .zty = declared, .value = body.value };
+            }
+            return body;
         },
-        .grouped_expression => return evalConstInt(ctx, tree, tree.nodeData(node).node_and_token[0], bindings, depth + 1),
+        .enum_literal => {
+            const zty = expected orelse return null;
+            const def = switch (zty) {
+                .enumeration => |d| d,
+                else => return null,
+            };
+            const entry = def.field(tree.tokenSlice(tree.nodeMainToken(node))) orelse return null;
+            return .{ .zty = zty, .value = .{ .int = @bitCast(entry.value) } };
+        },
+        .grouped_expression => return evalInt(ctx, tree, tree.nodeData(node).node_and_token[0], bindings, depth + 1, expected),
         .negation => {
-            const value = evalConstInt(ctx, tree, tree.nodeData(node).node, bindings, depth + 1) orelse return null;
-            return 0 -% value;
+            const value = evalInt(ctx, tree, tree.nodeData(node).node, bindings, depth + 1, expected) orelse return null;
+            if (value.zty != .int and value.zty != .enumeration) return null;
+            return .{ .zty = value.zty, .value = .{ .int = 0 -% value.value.int } };
         },
         .add, .sub, .mul, .bit_and, .bit_or, .bit_xor, .shl, .shr => {
             const operands = tree.nodeData(node).node_and_node;
-            const lhs = evalConstInt(ctx, tree, operands[0], bindings, depth + 1) orelse return null;
-            const rhs = evalConstInt(ctx, tree, operands[1], bindings, depth + 1) orelse return null;
-            return switch (tree.nodeTag(node)) {
-                .add => lhs +% rhs,
-                .sub => lhs -% rhs,
-                .mul => lhs *% rhs,
-                .bit_and => lhs & rhs,
-                .bit_or => lhs | rhs,
-                .bit_xor => lhs ^ rhs,
-                .shl => if (rhs >= 0 and rhs < 64) @bitCast(@as(u64, @bitCast(lhs)) << @as(u6, @intCast(rhs))) else null,
-                .shr => if (rhs >= 0 and rhs < 64) lhs >> @as(u6, @intCast(rhs)) else null,
+            const lhs = evalInt(ctx, tree, operands[0], bindings, depth + 1, expected) orelse return null;
+            const rhs = evalInt(ctx, tree, operands[1], bindings, depth + 1, if (lhs.zty == .enumeration) lhs.zty else expected) orelse return null;
+            if (!lhs.zty.eql(rhs.zty)) return null;
+            const a = lhs.value.int;
+            const b = rhs.value.int;
+            const result = switch (tree.nodeTag(node)) {
+                .add => a +% b,
+                .sub => a -% b,
+                .mul => a *% b,
+                .bit_and => a & b,
+                .bit_or => a | b,
+                .bit_xor => a ^ b,
+                .shl => if (b >= 0 and b < 64) @as(i64, @bitCast(@as(u64, @bitCast(a)) << @as(u6, @intCast(b)))) else return null,
+                .shr => if (b >= 0 and b < 64) a >> @as(u6, @intCast(b)) else return null,
                 else => unreachable,
             };
+            return .{ .zty = lhs.zty, .value = .{ .int = result } };
+        },
+        .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => {
+            const operands = tree.nodeData(node).node_and_node;
+            const lhs = evalInt(ctx, tree, operands[0], bindings, depth + 1, expected) orelse return null;
+            const rhs = evalInt(ctx, tree, operands[1], bindings, depth + 1, lhs.zty) orelse return null;
+            if (!lhs.zty.eql(rhs.zty)) return null;
+            const a = lhs.value.int;
+            const b = rhs.value.int;
+            const answer = switch (tree.nodeTag(node)) {
+                .equal_equal => a == b,
+                .bang_equal => a != b,
+                .less_than => a < b,
+                .greater_than => a > b,
+                .less_or_equal => a <= b,
+                .greater_or_equal => a >= b,
+                else => unreachable,
+            };
+            return .{ .zty = .boolean, .value = .{ .boolean = answer } };
         },
         .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {
             var buf: [2]Ast.Node.Index = undefined;
@@ -1596,80 +1902,181 @@ fn evalConstInt(ctx: *Ctx, tree: *const Ast, node: Ast.Node.Index, bindings: []c
             const name = builtinName(tree, node);
             if (std.mem.eql(u8, name, "@as")) {
                 if (args.len != 2) return null;
-                return evalConstInt(ctx, tree, args[1], bindings, depth + 1);
+                const target = resolveTypeIn(ctx, tree, ownerDir(ctx, tree), args[0]) catch return null;
+                return evalInt(ctx, tree, args[1], bindings, depth + 1, target);
             }
             if (std.mem.eql(u8, name, "@bitCast") or std.mem.eql(u8, name, "@intCast") or std.mem.eql(u8, name, "@truncate")) {
                 if (args.len != 1) return null;
-                return evalConstInt(ctx, tree, args[0], bindings, depth + 1);
+                return evalInt(ctx, tree, args[0], bindings, depth + 1, expected);
+            }
+            if (std.mem.eql(u8, name, "@intFromEnum")) {
+                if (args.len != 1) return null;
+                const source = evalInt(ctx, tree, args[0], bindings, depth + 1, expected) orelse return null;
+                const def = switch (source.zty) {
+                    .enumeration => |d| d,
+                    else => return null,
+                };
+                const zty = ZType{ .int = .{ .signed = def.backing.signed, .bits = def.backing.bits } };
+                return .{ .zty = zty, .value = source.value };
+            }
+            if (std.mem.eql(u8, name, "@enumFromInt")) {
+                if (args.len != 1) return null;
+                const target = expected orelse return null;
+                if (target != .enumeration) return null;
+                const source = evalInt(ctx, tree, args[0], bindings, depth + 1, null) orelse return null;
+                if (source.zty != .int) return null;
+                return .{ .zty = target, .value = source.value };
             }
             return null;
         },
-        .call_one, .call_one_comma, .call, .call_comma => {
-            var call_buf: [1]Ast.Node.Index = undefined;
-            const call = tree.fullCall(&call_buf, node) orelse return null;
-            if (tree.nodeTag(call.ast.fn_expr) != .identifier or call.ast.params.len > 8) return null;
-            const name = tree.tokenSlice(tree.nodeMainToken(call.ast.fn_expr));
-            var proto_node: ?Ast.Node.Index = null;
-            var body_node: ?Ast.Node.Index = null;
-            for (tree.rootDecls()) |decl| {
-                if (tree.nodeTag(decl) != .fn_decl) continue;
-                const data = tree.nodeData(decl).node_and_node;
-                var proto_buf: [1]Ast.Node.Index = undefined;
-                const proto = tree.fullFnProto(&proto_buf, data[0]) orelse continue;
-                const name_token = proto.name_token orelse continue;
-                if (std.mem.eql(u8, tree.tokenSlice(name_token), name)) {
-                    proto_node = data[0];
-                    body_node = data[1];
-                    break;
-                }
-            }
-            const function_proto_node = proto_node orelse return null;
-            const function_body = body_node orelse return null;
-            var proto_buf: [1]Ast.Node.Index = undefined;
-            const proto = tree.fullFnProto(&proto_buf, function_proto_node) orelse return null;
-            var local_bindings: [8]ConstBinding = undefined;
-            var binding_count: usize = 0;
-            var params = proto.iterate(tree);
-            while (params.next()) |param| {
-                if (binding_count >= call.ast.params.len) return null;
-                const name_token = param.name_token orelse return null;
-                const value = evalConstInt(ctx, tree, call.ast.params[binding_count], bindings, depth + 1) orelse return null;
-                local_bindings[binding_count] = .{ .name = tree.tokenSlice(name_token), .value = value };
-                binding_count += 1;
-            }
-            if (binding_count != call.ast.params.len) return null;
-            var stmt_buf: [2]Ast.Node.Index = undefined;
-            const statements = blockStatements(tree, function_body, &stmt_buf);
-            if (statements.len != 1 or tree.nodeTag(statements[0]) != .@"return") return null;
-            const return_node = tree.nodeData(statements[0]).opt_node.unwrap() orelse return null;
-            return evalConstInt(ctx, tree, return_node, local_bindings[0..binding_count], depth + 1);
-        },
+        .call_one, .call_one_comma, .call, .call_comma => return evalIntCall(ctx, tree, node, bindings, depth, expected),
         else => return null,
     }
 }
 
-fn evalTopConst(ctx: *Ctx, node: Ast.Node.Index) ?ConstValue {
-    if (evalBuiltinArchEqual(ctx, node)) |value| return .{ .boolean = value };
-    if (ctx.tree.nodeTag(node) == .identifier) {
-        const name = ctx.tree.tokenSlice(ctx.tree.nodeMainToken(node));
-        if (std.mem.eql(u8, name, "true")) return .{ .boolean = true };
-        if (std.mem.eql(u8, name, "false")) return .{ .boolean = false };
+/// Evaluate a call to another function at comptime. Only the shape a standard-library
+/// integer helper has is supported: fixed parameters, local `const`s bound to evaluated
+/// arguments or literals, and a final `return`. Anything else declines, so the caller
+/// falls back to ordinary lowering rather than guessing.
+fn evalIntCall(
+    ctx: *Ctx,
+    tree: *const Ast,
+    node: Ast.Node.Index,
+    bindings: []const ConstBinding,
+    depth: u8,
+    expected: ?ZType,
+) ?EvalValue {
+    var call_buf: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&call_buf, node) orelse return null;
+    if (tree.nodeTag(call.ast.fn_expr) != .identifier) return null;
+    const name = tree.tokenSlice(tree.nodeMainToken(call.ast.fn_expr));
+    var proto_node: ?Ast.Node.Index = null;
+    var body_node: ?Ast.Node.Index = null;
+    for (tree.rootDecls()) |decl| {
+        if (tree.nodeTag(decl) != .fn_decl) continue;
+        const data = tree.nodeData(decl).node_and_node;
+        var proto_buf: [1]Ast.Node.Index = undefined;
+        const proto = tree.fullFnProto(&proto_buf, data[0]) orelse continue;
+        const name_token = proto.name_token orelse continue;
+        if (std.mem.eql(u8, tree.tokenSlice(name_token), name)) {
+            proto_node = data[0];
+            body_node = data[1];
+            break;
+        }
     }
-    return .{ .int = evalConstInt(ctx, ctx.tree, node, &.{}, 0) orelse return null };
+    const proto = tree.fullFnProto(&call_buf, proto_node orelse return null) orelse return null;
+    const body = body_node orelse return null;
+    var local_bindings: [8]ConstBinding = undefined;
+    var binding_count: usize = 0;
+    var param_index: usize = 0;
+    var params = proto.iterate(tree);
+    while (params.next()) |param| {
+        const name_token = param.name_token orelse return null;
+        // A `comptime T: type` parameter is bound from the argument's type, not value.
+        if (param.comptime_noalias) |token| {
+            if (tree.tokenTag(token) == .keyword_comptime) {
+                if (param_index >= call.ast.params.len) return null;
+                const zty = resolveTypeIn(ctx, tree, ownerDir(ctx, tree), call.ast.params[param_index]) catch return null;
+                if (zty != .int or zty.int.bits == 0) return null;
+                local_bindings[binding_count] = .{ .name = tree.tokenSlice(name_token), .value = @intCast(zty.int.bits) };
+                binding_count += 1;
+                param_index += 1;
+                continue;
+            }
+        }
+        if (param_index >= call.ast.params.len or binding_count >= local_bindings.len) return null;
+        const param_type = resolveTypeIn(ctx, tree, ownerDir(ctx, tree), param.type_expr orelse return null) catch return null;
+        const value = evalInt(ctx, tree, call.ast.params[param_index], bindings, depth + 1, if (param_type == .int) param_type else null) orelse return null;
+        local_bindings[binding_count] = .{ .name = tree.tokenSlice(name_token), .value = value.value.int };
+        binding_count += 1;
+        param_index += 1;
+    }
+    if (param_index != call.ast.params.len) return null;
+    var stmt_buf: [2]Ast.Node.Index = undefined;
+    const statements = blockStatements(tree, body, &stmt_buf);
+    for (statements) |statement| {
+        switch (tree.nodeTag(statement)) {
+            .simple_var_decl, .local_var_decl => {
+                const vd = tree.fullVarDecl(statement) orelse return null;
+                if (tree.tokenTag(vd.ast.mut_token) != .keyword_const) return null;
+                const var_name = tree.tokenSlice(vd.ast.mut_token + 1);
+                const declared = if (vd.ast.type_node.unwrap()) |type_node|
+                    resolveTypeIn(ctx, tree, ownerDir(ctx, tree), type_node) catch return null
+                else
+                    null;
+                const init_node = vd.ast.init_node.unwrap() orelse return null;
+                const value = evalInt(ctx, tree, init_node, local_bindings[0..binding_count], depth + 1, declared) orelse return null;
+                if (binding_count == local_bindings.len) return null;
+                local_bindings[binding_count] = .{ .name = var_name, .value = value.value.int };
+                binding_count += 1;
+            },
+            .@"return" => {
+                const return_node = tree.nodeData(statement).opt_node.unwrap() orelse return null;
+                return evalInt(ctx, tree, return_node, local_bindings[0..binding_count], depth + 1, expected);
+            },
+            else => return null,
+        }
+    }
+    return null;
 }
 
-fn evalDeferredConst(ctx: *Ctx, name: []const u8, depth: u8) ?ConstValue {
+/// Does `value` fit `zty` as an integer bit pattern?
+fn fitsInt(zty: ZType, value: i64) bool {
+    const int = switch (zty) {
+        .int => |i| i,
+        .enumeration => |e| e.backing,
+        else => return false,
+    };
+    if (int.bits >= 64) return true;
+    const magnitude: u64 = @bitCast(value);
+    return magnitude >> @intCast(int.bits) == 0;
+}
+
+/// An implicit coercion allowed during comptime evaluation only (`usize` to `u64`,
+/// `comptime_int` to a named integer type). Runtime coercion stays in `convertTo`.
+fn comptimeCoerces(from: ZType, to: ZType) bool {
+    return switch (from) {
+        .enumeration => |a| switch (to) {
+            .enumeration => |b| a.backing.signed == b.backing.signed and a.backing.bits <= b.backing.bits,
+            else => false,
+        },
+        .int => |a| switch (to) {
+            .int => |b| a.signed == b.signed and a.bits <= b.bits,
+            else => false,
+        },
+        else => false,
+    };
+}
+
+fn ownerDir(ctx: *Ctx, tree: *const Ast) []const u8 {
+    if (ctx.tree == tree) return ctx.dir;
+    if (ctx.modules) |modules| if (modules.owner(tree)) |file| return file.dir;
+    return ctx.dir;
+}
+fn evalTopConst(ctx: *Ctx, node: Ast.Node.Index) ?ConstEntry {
+    if (evalBuiltinArchEqual(ctx, node)) |value| return .{ .zty = .boolean, .value = .{ .boolean = value } };
+    if (ctx.tree.nodeTag(node) == .identifier) {
+        const name = ctx.tree.tokenSlice(ctx.tree.nodeMainToken(node));
+        if (std.mem.eql(u8, name, "true")) return .{ .zty = .boolean, .value = .{ .boolean = true } };
+        if (std.mem.eql(u8, name, "false")) return .{ .zty = .boolean, .value = .{ .boolean = false } };
+    }
+    const value = evalInt(ctx, ctx.tree, node, &.{}, 0, null) orelse return null;
+    return .{ .zty = value.zty, .value = value.value };
+}
+
+fn evalDeferredConst(ctx: *Ctx, name: []const u8, depth: u8) ?ConstEntry {
     if (depth == 32) return null;
     if (ctx.constants.get(name)) |value| return value;
     const init = ctx.deferred_constants.get(name) orelse return null;
     if (ctx.tree.nodeTag(init) == .identifier) {
         const alias = ctx.tree.tokenSlice(ctx.tree.nodeMainToken(init));
-        if (std.mem.eql(u8, alias, "true")) return .{ .boolean = true };
-        if (std.mem.eql(u8, alias, "false")) return .{ .boolean = false };
+        if (std.mem.eql(u8, alias, "true")) return .{ .zty = .boolean, .value = .{ .boolean = true } };
+        if (std.mem.eql(u8, alias, "false")) return .{ .zty = .boolean, .value = .{ .boolean = false } };
         if (evalDeferredConst(ctx, alias, depth + 1)) |value| return value;
     }
-    if (evalBuiltinArchEqual(ctx, init)) |value| return .{ .boolean = value };
-    return .{ .int = evalConstInt(ctx, ctx.tree, init, &.{}, depth + 1) orelse return null };
+    if (evalBuiltinArchEqual(ctx, init)) |value| return .{ .zty = .boolean, .value = .{ .boolean = value } };
+    const value = evalInt(ctx, ctx.tree, init, &.{}, depth + 1, null) orelse return null;
+    return .{ .zty = value.zty, .value = value.value };
 }
 
 /// Resolve the integer constant expressions used as fixed-array lengths. Imported Zig
@@ -1682,7 +2089,7 @@ fn evalArrayLength(ctx: *Ctx, tree: *const Ast, node: Ast.Node.Index, depth: u8)
         .identifier => {
             const name = tree.tokenSlice(tree.nodeMainToken(node));
             if (tree == ctx.tree) {
-                if (ctx.constants.get(name)) |value| switch (value) {
+                if (ctx.constants.get(name)) |value| switch (value.value) {
                     .int => |integer| return if (integer >= 0) @intCast(integer) else null,
                     .boolean => {},
                 };
@@ -1792,6 +2199,18 @@ const FnSig = struct {
     is_variadic: bool = false,
     is_noreturn: bool = false,
 };
+
+/// `Enum.tag` used as a value (the field lives in the container, not in a variable).
+fn enumFieldOrDefault(l: *L, fn_expr: Ast.Node.Index) Error!?TypedValue {
+    if (l.r.tree.nodeTag(fn_expr) != .field_access) return null;
+    const access = l.r.tree.nodeData(fn_expr).node_and_token;
+    const resolved = resolveQualifiedName(l.r, l.r.tree, l.r.dir, access[0]) catch return null;
+    const container = resolved.node orelse return null;
+    const zty = resolveEnumTypeIn(l.r, resolved.tree, resolved.dir, container) orelse return null;
+    const field_name = l.r.tree.tokenSlice(access[1]);
+    const entry = zty.enumeration.field(field_name) orelse return null;
+    return .{ .value = try l.func.appendInst(l.block, try zty.irType(l.func), .{ .iconst = std.math.cast(i64, entry.value) orelse @as(i64, @bitCast(entry.value)) }), .zty = zty };
+}
 
 fn findFnSig(sigs: []const FnSig, name: []const u8) ?FnSig {
     for (sigs) |s| if (std.mem.eql(u8, s.name, name)) return s;
@@ -2151,6 +2570,17 @@ fn toI64(l: *L, tv: TypedValue) Error!Value {
 /// silently truncating, matching this subset's "no comptime_int peer resolution" simplicity.
 fn convertTo(l: *L, tv: TypedValue, target: ZType) Error!TypedValue {
     if (tv.zty.eql(target)) return tv;
+    if (target == .enumeration) {
+        // A named enum tag may be assigned from another enum with the same backing
+        // shape (implicit literals stay nominal via `lowerEnumLiteral`), but never from
+        // a plain integer without an explicit cast.
+        if (tv.zty != .enumeration) return Error.TypeMismatch;
+        if (!comptimeCoerces(ZType{ .int = tv.zty.enumeration.backing }, ZType{ .int = target.enumeration.backing })) return Error.TypeMismatch;
+        const irty = try target.irType(l.func);
+        const value = try l.func.appendInst(l.block, irty, .{ .convert = .{ .value = tv.value } });
+        return .{ .value = value, .zty = target };
+    }
+    if (tv.zty == .enumeration and target == .int) return Error.TypeMismatch;
     switch (tv.zty) {
         .int => |si| switch (target) {
             .int => |ti| if (ti.signed != si.signed or ti.bits < si.bits) return Error.TypeMismatch,
@@ -2237,6 +2667,24 @@ fn lowerAddr(l: *L, node: Ast.Node.Index) Error!TypedValue {
         },
         .field_access => {
             const d = tree.nodeData(node).node_and_token;
+            // `Enum.tag` where `Enum` is a top-level declaration in this file.
+            if (resolveQualifiedName(l.r, tree, l.r.dir, d[0])) |resolved| {
+                if (resolved.node) |container| {
+                    if (resolveEnumTypeIn(l.r, resolved.tree, resolved.dir, container)) |zty| {
+                        const entry = zty.enumeration.field(tree.tokenSlice(d[1])) orelse return Error.UnknownField;
+                        return .{ .value = try l.func.appendInst(l.block, try zty.irType(l.func), .{ .iconst = std.math.cast(i64, entry.value) orelse @as(i64, @bitCast(entry.value)) }), .zty = zty };
+                    }
+                }
+            } else |_| {}
+            if (tree.nodeTag(d[0]) == .identifier) {
+                const base_name = tree.tokenSlice(tree.nodeMainToken(d[0]));
+                if (l.r.local_types.get(base_name)) |zty| {
+                    if (zty != .enumeration) return Error.UnsupportedNode;
+                    const entry = zty.enumeration.field(tree.tokenSlice(d[1])) orelse return Error.UnknownField;
+                    _ = try declareLocal(l, base_name, zty, null);
+                    return .{ .value = try l.func.appendInst(l.block, try zty.irType(l.func), .{ .iconst = std.math.cast(i64, entry.value) orelse @as(i64, @bitCast(entry.value)) }), .zty = zty };
+                }
+            }
             const qualified_base = resolveQualifiedName(l.r, tree, l.r.dir, d[0]) catch null;
             if (qualified_base) |resolved| if (resolved.node == null) {
                 const field_name = tree.tokenSlice(d[1]);
@@ -2831,6 +3279,8 @@ fn lowerCall(l: *L, node: Ast.Node.Index) Error!?TypedValue {
         if (foreign_sig) |resolved_sig| {
             fname = resolved_sig.name;
             sig = resolved_sig;
+        } else if (try enumFieldOrDefault(l, c.ast.fn_expr)) |constant| {
+            return constant;
         } else {
             const receiver = try lowerExpr(l, method[0], null);
             const method_sig = (try foreignMethodSig(l, receiver.zty, method_name)) orelse return Error.UnsupportedNode;
@@ -3180,6 +3630,47 @@ fn lowerBuiltinCall(l: *L, node: Ast.Node.Index, expected: ?ZType) Error!?TypedV
         const cond = try l.func.appendInst(l.block, try boolType(l.func), .{ .icmp = .{ .op = op, .lhs = lhs.value, .rhs = rhs.value } });
         const value = try l.func.appendInst(l.block, try lhs.zty.irType(l.func), .{ .select = .{ .cond = cond, .then = lhs.value, .@"else" = rhs.value } });
         return .{ .value = value, .zty = lhs.zty };
+    }
+    if (std.mem.eql(u8, name, "@intFromEnum")) {
+        if (args.len != 1) return Error.CallArityMismatch;
+        const value = try lowerExpr(l, args[0], null);
+        if (value.zty != .enumeration) return Error.TypeMismatch;
+        const int = ZType{ .int = .{ .signed = value.zty.enumeration.backing.signed, .bits = value.zty.enumeration.backing.bits } };
+        const converted = try l.func.appendInst(l.block, try int.irType(l.func), .{ .convert = .{ .value = value.value } });
+        return .{ .value = converted, .zty = int };
+    }
+    if (std.mem.eql(u8, name, "@enumFromInt")) {
+        if (args.len != 1) return Error.CallArityMismatch;
+        const target = expected orelse return Error.TypeMismatch;
+        if (target != .enumeration) return Error.TypeMismatch;
+        const source = try lowerExpr(l, args[0], null);
+        if (source.zty != .int) return Error.TypeMismatch;
+        const converted = try l.func.appendInst(l.block, try target.irType(l.func), .{ .convert = .{ .value = source.value } });
+        return .{ .value = converted, .zty = target };
+    }
+    // `@fromBackingInt`/`@backingInt` (toolchain spellings of the conversions above) and
+    // `@intCast` are typed by their expected type where one exists.
+    if (std.mem.eql(u8, name, "@fromBackingInt") and expected != null and expected.? == .enumeration) {
+        if (args.len != 1) return Error.CallArityMismatch;
+        const target = expected.?;
+        const source = try lowerExpr(l, args[0], null);
+        if (source.zty != .int) return Error.TypeMismatch;
+        const converted = try l.func.appendInst(l.block, try target.irType(l.func), .{ .convert = .{ .value = source.value } });
+        return .{ .value = converted, .zty = target };
+    }
+    if (std.mem.eql(u8, name, "@as")) {
+        if (args.len != 2) return Error.CallArityMismatch;
+        const target = try resolveType(l.r, args[0]);
+        const value = try lowerExpr(l, args[1], target);
+        return try convertTo(l, value, target);
+    }
+    if (std.mem.eql(u8, name, "@backingInt")) {
+        if (args.len != 1) return Error.CallArityMismatch;
+        const value = try lowerExpr(l, args[0], null);
+        if (value.zty != .enumeration) return Error.TypeMismatch;
+        const int = ZType{ .int = .{ .signed = value.zty.enumeration.backing.signed, .bits = value.zty.enumeration.backing.bits } };
+        const converted = try l.func.appendInst(l.block, try int.irType(l.func), .{ .convert = .{ .value = value.value } });
+        return .{ .value = converted, .zty = int };
     }
     if (std.mem.eql(u8, name, "@errorName")) {
         if (args.len != 1) return Error.CallArityMismatch;
@@ -3698,6 +4189,11 @@ fn lowerExpectedErrorUnion(l: *L, node: Ast.Node.Index, zty: ZType) Error!TypedV
 fn lowerExpr(l: *L, node: Ast.Node.Index, expected: ?ZType) Error!TypedValue {
     const tree = l.r.tree;
     if (l.r.modules) |modules| modules.mark(tree, node);
+    // A qualified enum tag (`Limit.unlimited`) is a value, not an address; resolve it
+    // before the general field-access path treats the name as storage.
+    if (tree.nodeTag(node) == .field_access) {
+        if (try enumFieldOrDefault(l, node)) |constant| return constant;
+    }
     if (try importedIntegerConstant(l, node, expected)) |constant| return constant;
     if (expected != null and tree.nodeTag(node) == .@"orelse") return lowerOrelse(l, node, expected);
     if (tree.nodeTag(node) == .@"catch") return lowerCatchExpr(l, node, expected);
@@ -3718,6 +4214,7 @@ fn lowerExpr(l: *L, node: Ast.Node.Index, expected: ?ZType) Error!TypedValue {
         .string_literal => return lowerStringLiteral(l, node, expected),
         .number_literal => return lowerNumberLiteral(l, node, expected),
         .error_value => return lowerErrorValue(l, node, expected),
+        .enum_literal => return lowerEnumLiteral(l, node, expected),
         .grouped_expression => return lowerExpr(l, tree.nodeData(node).node_and_token[0], expected),
         .identifier => {
             const name = tree.tokenSlice(tree.nodeMainToken(node));
@@ -3732,24 +4229,7 @@ fn lowerExpr(l: *L, node: Ast.Node.Index, expected: ?ZType) Error!TypedValue {
                 if (zty != .optional_ptr) return Error.TypeMismatch;
                 return .{ .value = try l.func.appendInst(l.block, try zty.irType(l.func), .{ .iconst = 0 }), .zty = zty };
             }
-            if (evalDeferredConst(l.r, name, 0)) |constant| return switch (constant) {
-                .boolean => |value| .{ .value = try l.func.appendInst(l.block, try boolType(l.func), .{ .iconst = @intFromBool(value) }), .zty = .boolean },
-                .int => |value| blk: {
-                    const zty = expected orelse ZType{ .int = .{ .signed = true, .bits = 64 } };
-                    if (zty != .int) return Error.TypeMismatch;
-                    const fits = if (zty.int.signed) signed_range: {
-                        if (zty.int.bits == 64) break :signed_range true;
-                        const limit = @as(i64, 1) << @intCast(zty.int.bits - 1);
-                        break :signed_range value >= -limit and value < limit;
-                    } else unsigned_range: {
-                        if (value < 0) break :unsigned_range false;
-                        if (zty.int.bits == 64) break :unsigned_range true;
-                        break :unsigned_range @as(u64, @intCast(value)) < (@as(u64, 1) << @intCast(zty.int.bits));
-                    };
-                    if (!fits) return Error.IntegerOverflow;
-                    break :blk .{ .value = try l.func.appendInst(l.block, try zty.irType(l.func), .{ .iconst = value }), .zty = zty };
-                },
-            };
+            if (try localConstEntry(l, name)) |constant| return try constEntryValue(l, constant, expected);
             return loadOrDecay(l, try lowerAddr(l, node));
         },
         .deref, .array_access, .field_access => return loadOrDecay(l, try lowerAddr(l, node)),
@@ -3778,7 +4258,9 @@ fn lowerExpr(l: *L, node: Ast.Node.Index, expected: ?ZType) Error!TypedValue {
             const d = tree.nodeData(node).node_and_node;
             const lhs = try lowerExpr(l, d[0], null);
             const rhs = try lowerExpr(l, d[1], lhs.zty);
-            if (!lhs.zty.eql(rhs.zty)) return Error.TypeMismatch;
+            const lhs_ok = lhs.zty.eql(rhs.zty) or enumLike(lhs.zty) and enumLike(rhs.zty) and
+                comptimeCoerces(enumBackingOf(lhs.zty), enumBackingOf(rhs.zty));
+            if (!lhs_ok) return Error.TypeMismatch;
             const boolt = try boolType(l.func);
             const r = try l.func.appendInst(l.block, boolt, .{ .icmp = .{ .op = cmpOpFor(tree.nodeTag(node)).?, .lhs = lhs.value, .rhs = rhs.value } });
             return .{ .value = r, .zty = .boolean };
@@ -4079,6 +4561,16 @@ fn lowerStmt(l: *L, stmt: Ast.Node.Index) Error!bool {
                 if (zty != .array) return Error.UnsupportedType;
                 const addr = try declareLocal(l, name, zty, null);
                 try lowerArrayInitInto(l, init_node, addr, zty.array);
+                return false;
+            }
+
+            // A local `const Name = enum {...};` (or struct) declares a type, not a value.
+            var local_container_buf: [2]Ast.Node.Index = undefined;
+            if (tree.fullContainerDecl(&local_container_buf, init_node)) |container| {
+                const tag = tree.tokenTag(container.ast.main_token);
+                if (tag != .keyword_struct and tag != .keyword_enum) return Error.UnsupportedNode;
+                const zty = try resolveContainerTypeIn(l.r, tree, l.r.dir, init_node);
+                try l.r.local_types.put(l.r.arena, name, zty);
                 return false;
             }
 
@@ -4775,8 +5267,10 @@ fn lowerRoot(
 
                 var buf2: [2]Ast.Node.Index = undefined;
                 if (tree.fullContainerDecl(&buf2, init_node)) |container| {
-                    if (tree.tokenTag(container.ast.main_token) == .keyword_struct) {
-                        try ctx.nodes.put(arena, name, init_node);
+                    switch (tree.tokenTag(container.ast.main_token)) {
+                        .keyword_struct => try ctx.nodes.put(arena, name, init_node),
+                        .keyword_enum => try ctx.type_decls.put(arena, name, .{ .decl_node = init_node }),
+                        else => {},
                     }
                     continue;
                 }
@@ -4826,8 +5320,10 @@ fn lowerRoot(
                 }
                 var constant: ?ConstValue = null;
                 if (tree.tokenTag(vd.ast.mut_token) == .keyword_const) {
-                    constant = evalTopConst(&ctx, init_node);
-                    if (constant) |value| try ctx.constants.put(arena, name, value);
+                    if (evalTopConst(&ctx, init_node)) |entry| {
+                        constant = entry.value;
+                        try ctx.constants.put(arena, name, entry);
+                    }
                 }
                 const type_node = vd.ast.type_node.unwrap() orelse return Error.UnsupportedType;
                 try global_nodes.append(arena, .{
@@ -4877,7 +5373,8 @@ fn lowerRoot(
     for (global_nodes.items) |global| {
         if (global.is_extern) continue;
         const def = ctx.globals.get(global.name).?;
-        data[data_built] = try lowerGlobalData(gpa, tree, global.name, def.zty, global.is_const, global.init_node.?, global.constant orelse evalTopConst(&ctx, global.init_node.?));
+        const constant = global.constant orelse if (evalTopConst(&ctx, global.init_node.?)) |entry| entry.value else null;
+        data[data_built] = try lowerGlobalData(gpa, tree, global.name, def.zty, global.is_const, global.init_node.?, constant);
         data_built += 1;
     }
     for (inferred_data.items) |d| {
