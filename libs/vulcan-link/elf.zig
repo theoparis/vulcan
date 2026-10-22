@@ -517,7 +517,9 @@ fn parseObject64(allocator: std.mem.Allocator, buf: []const u8) Error!ParsedObje
         const rela_size = try rdInt(u64, buf, rela_hdr + 32);
         const sh_info = try rdInt(u32, buf, rela_hdr + 44);
         // The section this RELA modifies, and hence which `ObjSection.relocs` list it feeds.
-        const target_sec: u32 = if (sh_info < shnum) sec_map[sh_info] else std.math.maxInt(u32);
+        if (sh_info >= shnum) return error.MalformedObject;
+        const target_sec = sec_map[sh_info];
+        if (target_sec == std.math.maxInt(u32)) continue;
         const rela_count: usize = @intCast(rela_size / 24);
         var r: usize = 0;
         while (r < rela_count) : (r += 1) {
@@ -567,7 +569,7 @@ fn parseObject64(allocator: std.mem.Allocator, buf: []const u8) Error!ParsedObje
                 .type = rt,
                 .addend = r_addend,
             };
-            if (target_sec != std.math.maxInt(u32)) try sec_relocs[target_sec].append(allocator, reloc);
+            try sec_relocs[target_sec].append(allocator, reloc);
         }
     }
 
@@ -707,7 +709,9 @@ fn parseObject32(allocator: std.mem.Allocator, buf: []const u8) Error!ParsedObje
         const rel_size = try rdInt(u32, buf, rel_hdr + 20);
         const sh_info = try rdInt(u32, buf, rel_hdr + 28);
         // The section this REL modifies, and hence which `ObjSection.relocs` list it feeds.
-        const target_sec: u32 = if (sh_info < shnum) sec_map[sh_info] else std.math.maxInt(u32);
+        if (sh_info >= shnum) return error.MalformedObject;
+        const target_sec = sec_map[sh_info];
+        if (target_sec == std.math.maxInt(u32)) continue;
         const rel_count: usize = @intCast(rel_size / 8);
         var r: usize = 0;
         while (r < rel_count) : (r += 1) {
@@ -727,7 +731,7 @@ fn parseObject32(allocator: std.mem.Allocator, buf: []const u8) Error!ParsedObje
                 .symbol = sym_index,
                 .type = rt,
             };
-            if (target_sec != std.math.maxInt(u32)) try sec_relocs[target_sec].append(allocator, reloc);
+            try sec_relocs[target_sec].append(allocator, reloc);
         }
     }
 
@@ -864,4 +868,66 @@ test "parseObject64: two same-class sections stay separate in the new sections t
     }
     try std.testing.expect(seen_func1);
     try std.testing.expect(seen_func2);
+}
+
+test "discarded-section relocations are ignored but live and invalid targets are checked" {
+    const a = std.testing.allocator;
+    inline for (.{ true, false }) |wide| {
+        const Word = if (wide) u64 else u32;
+        const header_size: u16 = if (wide) 64 else 52;
+        const section_size: u16 = if (wide) 64 else 40;
+        const symbol_size: u32 = if (wide) 24 else 16;
+        const relocation_size: u32 = if (wide) 24 else 8;
+        const section_offset = 128;
+        var bytes: [448]u8 = @splat(0);
+        @memcpy(bytes[0..4], "\x7fELF");
+        bytes[4] = if (wide) 2 else 1;
+        bytes[5] = 1;
+        std.mem.writeInt(u16, bytes[18..20], if (wide) EM_X86_64 else EM_386, .little);
+        const shoff_field = if (wide) 40 else 32;
+        std.mem.writeInt(Word, bytes[shoff_field..][0..@sizeOf(Word)], section_offset, .little);
+        const sizes_field = if (wide) 52 else 40;
+        std.mem.writeInt(u16, bytes[sizes_field..][0..2], header_size, .little);
+        std.mem.writeInt(u16, bytes[sizes_field + 6 ..][0..2], section_size, .little);
+        std.mem.writeInt(u16, bytes[sizes_field + 8 ..][0..2], 5, .little);
+
+        const writeSection = struct {
+            fn put(buffer: []u8, index: usize, kind: u32, offset: u32, size: u32, link: u32, info: u32) void {
+                const section = buffer[section_offset + index * section_size ..][0..section_size];
+                std.mem.writeInt(u32, section[4..8], kind, .little);
+                const offset_field = if (wide) 24 else 16;
+                std.mem.writeInt(Word, section[offset_field..][0..@sizeOf(Word)], offset, .little);
+                std.mem.writeInt(Word, section[offset_field + @sizeOf(Word) ..][0..@sizeOf(Word)], size, .little);
+                const link_field = if (wide) 40 else 24;
+                std.mem.writeInt(u32, section[link_field..][0..4], link, .little);
+                std.mem.writeInt(u32, section[link_field + 4 ..][0..4], info, .little);
+            }
+        }.put;
+        writeSection(&bytes, 1, SHT_PROGBITS, 64, 8, 0, 0);
+        writeSection(&bytes, 2, SHT_SYMTAB, 72, symbol_size, 3, 1);
+        writeSection(&bytes, 3, 3, 96, 1, 0, 0);
+        writeSection(&bytes, 4, if (wide) SHT_RELA else SHT_REL, 104, relocation_size, 2, 1);
+        const info_offset = if (wide) 112 else 108;
+        std.mem.writeInt(Word, bytes[info_offset..][0..@sizeOf(Word)], if (wide) 0xffff else 0xff, .little);
+
+        {
+            var parsed = try parseObject(a, &bytes);
+            defer parsed.deinit(a);
+            try std.testing.expectEqual(@as(usize, 0), parsed.sections.len);
+        }
+        const flags_offset = section_offset + section_size + 8;
+        std.mem.writeInt(Word, bytes[flags_offset..][0..@sizeOf(Word)], SHF_ALLOC, .little);
+        try std.testing.expectError(error.UnsupportedReloc, parseObject(a, &bytes));
+
+        std.mem.writeInt(Word, bytes[info_offset..][0..@sizeOf(Word)], if (wide) 1 else @backingInt(RelocType.abs32), .little);
+        {
+            var parsed = try parseObject(a, &bytes);
+            defer parsed.deinit(a);
+            try std.testing.expectEqual(@as(usize, 1), parsed.sections[0].relocs.len);
+            try std.testing.expectEqual(if (wide) RelocType.abs64 else RelocType.abs32, parsed.sections[0].relocs[0].type);
+        }
+        const target_offset = section_offset + 4 * section_size + if (wide) 44 else 28;
+        std.mem.writeInt(u32, bytes[target_offset..][0..4], 5, .little);
+        try std.testing.expectError(error.MalformedObject, parseObject(a, &bytes));
+    }
 }
