@@ -575,6 +575,87 @@ test "slice parameters lower to pointer and length ABI values" {
     try std.testing.expectEqual(@as(usize, bytes.len), r.f(&bytes, bytes.len));
 }
 
+test "slicing syntax and array-to-slice coercion" {
+    const a = std.testing.allocator;
+    var mod = try zigc.compile(a,
+        \\fn sliceSum() u64 {
+        \\    var arr = [_]u64{ 10, 20, 30, 40, 50 };
+        \\    const sl: []const u64 = &arr;
+        \\    const sub = sl[1..4];
+        \\    const tail = sub[1..];
+        \\    return sub.len + tail.len + tail[0] + tail[1];
+        \\}
+    );
+    defer mod.deinit(a);
+    var r = try jitFn(a, &mod, "sliceSum", *const fn () callconv(.c) u64);
+    defer r.j.deinit();
+    // sub is arr[1..4] = [20, 30, 40], len = 3
+    // tail is sub[1..] = [30, 40], len = 2
+    // tail[0] = 30, tail[1] = 40
+    // sum = 3 + 2 + 30 + 40 = 75
+    try std.testing.expectEqual(@as(u64, 75), r.f());
+}
+
+test "slicing directly on fixed-size array and string literal" {
+    const a = std.testing.allocator;
+    var mod = try zigc.compile(a,
+        \\fn directSlice() usize {
+        \\    var arr = [_]u8{ 'h', 'e', 'l', 'l', 'o' };
+        \\    const sl = arr[1..4];
+        \\    const str_sl = "world"[1..3];
+        \\    const first: usize = sl[0];
+        \\    const second: usize = str_sl[0];
+        \\    return sl.len + str_sl.len + first + second;
+        \\}
+    );
+    defer mod.deinit(a);
+    var r = try jitFn(a, &mod, "directSlice", *const fn () callconv(.c) usize);
+    defer r.j.deinit();
+    // sl = 'e','l','l' (len 3, sl[0] = 'e' = 101)
+    // str_sl = 'o','r' (len 2, str_sl[0] = 'o' = 111)
+    // sum = 3 + 2 + 101 + 111 = 217
+    try std.testing.expectEqual(@as(usize, 217), r.f());
+}
+
+test "returning slices from functions" {
+    const a = std.testing.allocator;
+    var mod = try zigc.compile(a,
+        \\fn subSlice(s: []const u8) []const u8 {
+        \\    return s[1..3];
+        \\}
+        \\fn callSub() usize {
+        \\    const full = "hello";
+        \\    const sub = subSlice(full);
+        \\    const first: usize = sub[0];
+        \\    const second: usize = sub[1];
+        \\    return sub.len + first + second;
+        \\}
+    );
+    defer mod.deinit(a);
+    var r = try jitFn(a, &mod, "callSub", *const fn () callconv(.c) usize);
+    defer r.j.deinit();
+    // sub is "el", len 2, 'e' = 101, 'l' = 108
+    // sum = 2 + 101 + 108 = 211
+    try std.testing.expectEqual(@as(usize, 211), r.f());
+}
+
+test "sentinel-terminated slices and pointers [:0]const u8" {
+    const a = std.testing.allocator;
+    var mod = try zigc.compile(a,
+        \\fn sentinelLen(s: [:0]const u8) usize {
+        \\    return s.len;
+        \\}
+        \\fn testSentinel() usize {
+        \\    const str: [:0]const u8 = "hello";
+        \\    return sentinelLen(str);
+        \\}
+    );
+    defer mod.deinit(a);
+    var r = try jitFn(a, &mod, "testSentinel", *const fn () callconv(.c) usize);
+    defer r.j.deinit();
+    try std.testing.expectEqual(@as(usize, 5), r.f());
+}
+
 test "import declarations: unused namespaces do not enter generated IR" {
     const a = std.testing.allocator;
     var mod = try zigc.compile(a,
@@ -705,10 +786,7 @@ test "error: unsupported type (comptime generic parameter)" {
     try std.testing.expectError(error.UnsupportedType, zigc.compile(a, "fn f(comptime T: type) T { return undefined; }"));
 }
 
-test "error: unsupported type (slice return)" {
-    const a = std.testing.allocator;
-    try std.testing.expectError(error.UnsupportedType, zigc.compile(a, "fn f(s: []i64) []i64 { return s; }"));
-}
+
 
 test "globals: direct data, read-only data, and zero-initialized storage persist across calls" {
     const a = std.testing.allocator;

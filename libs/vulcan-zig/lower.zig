@@ -779,10 +779,10 @@ fn resolveTypeIn(ctx: *Ctx, tree: *const Ast, dir: []const u8, node: Ast.Node.In
         },
         .array_type, .array_type_sentinel => {
             const at = tree.fullArrayType(node) orelse return Error.UnsupportedType;
-            const len = evalArrayLength(ctx, tree, at.ast.elem_count, 0) orelse return Error.UnsupportedType;
             const elem = try resolveTypeIn(ctx, tree, dir, at.ast.elem_type);
             const e = try ctx.arena.create(ZType);
             e.* = elem;
+            const len = evalArrayLength(ctx, tree, at.ast.elem_count, 0) orelse return ZType{ .array = .{ .len = 0, .elem = e } };
             return ZType{ .array = .{ .len = len, .elem = e } };
         },
         .field_access => {
@@ -1046,6 +1046,13 @@ fn lowerGlobalData(
 fn isStructInitTag(tag: Ast.Node.Tag) bool {
     return switch (tag) {
         .struct_init_one, .struct_init_one_comma, .struct_init_dot_two, .struct_init_dot_two_comma, .struct_init_dot, .struct_init_dot_comma, .struct_init, .struct_init_comma => true,
+        else => false,
+    };
+}
+
+fn isArrayInitTag(tag: Ast.Node.Tag) bool {
+    return switch (tag) {
+        .array_init_one, .array_init_one_comma, .array_init_dot_two, .array_init_dot_two_comma, .array_init_dot, .array_init_dot_comma, .array_init, .array_init_comma => true,
         else => false,
     };
 }
@@ -1722,6 +1729,9 @@ fn convertTo(l: *L, tv: TypedValue, target: ZType) Error!TypedValue {
         },
         .ptr => |source| switch (target) {
             .optional_ptr => |dest| if (source.eql(dest.*)) return .{ .value = tv.value, .zty = target },
+            .slice => |dest_elem| if (source.* == .array and source.array.elem.eql(dest_elem.*)) {
+                return packSlice(l, dest_elem, tv.value, @as(u64, source.array.len));
+            },
             else => return Error.TypeMismatch,
         },
         .optional_ptr => |source| switch (target) {
@@ -1854,7 +1864,7 @@ fn lowerStructInitInto(l: *L, node: Ast.Node.Index, dest: Value, sd: *const Stru
         if (field.ty == .strct) {
             try lowerStructInitInto(l, fv, addr, field.ty.strct);
         } else if (field.ty == .array) {
-            return Error.UnsupportedNode;
+            try lowerArrayInitInto(l, fv, addr, field.ty.array);
         } else if (field.ty == .optional_value) {
             const value = try lowerExpr(l, fv, field.ty);
             try copyOptional(l, field.ty, addr, value.value);
@@ -1864,6 +1874,44 @@ fn lowerStructInitInto(l: *L, node: Ast.Node.Index, dest: Value, sd: *const Stru
             try l.func.appendStore(l.block, conv.value, addr);
         }
     }
+}
+
+fn lowerArrayInitInto(l: *L, node: Ast.Node.Index, dest: Value, az: ZType.ZArray) Error!void {
+    const tree = l.r.tree;
+    var buf: [2]Ast.Node.Index = undefined;
+    const ai = tree.fullArrayInit(&buf, node) orelse return Error.UnsupportedNode;
+    if (ai.ast.elements.len != az.len) return Error.TypeMismatch;
+    for (ai.ast.elements, 0..) |elem_node, i| {
+        const offset = i * az.elem.byteSize();
+        const addr = try byteOffsetPtr(l, dest, offset);
+        if (az.elem.* == .strct) {
+            try lowerStructInitInto(l, elem_node, addr, az.elem.strct);
+        } else if (az.elem.* == .array) {
+            try lowerArrayInitInto(l, elem_node, addr, az.elem.array);
+        } else if (az.elem.* == .optional_value) {
+            const val = try lowerExpr(l, elem_node, az.elem.*);
+            try copyOptional(l, az.elem.*, addr, val.value);
+        } else {
+            const val = try lowerExpr(l, elem_node, az.elem.*);
+            const conv = try convertTo(l, val, az.elem.*);
+            try l.func.appendStore(l.block, conv.value, addr);
+        }
+    }
+}
+
+fn packSlice(l: *L, elem_zty: *const ZType, ptr_val: Value, len_val: anytype) Error!TypedValue {
+    const slice_zty = ZType{ .slice = elem_zty };
+    const ptr_ty = try l.func.types.ptrGlobal();
+    const len_ty = try l.func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+    const slot = try l.func.appendInst(l.block, ptr_ty, .{ .alloca = .{ .elem = try slice_zty.irType(l.func) } });
+    const len: Value = if (@TypeOf(len_val) == Value)
+        len_val
+    else
+        try l.func.appendInst(l.block, len_ty, .{ .iconst = @as(i64, @intCast(len_val)) });
+    const ptr_conv = try l.func.appendInst(l.block, ptr_ty, .{ .convert = .{ .value = ptr_val } });
+    try l.func.appendStore(l.block, ptr_conv, slot);
+    try l.func.appendStore(l.block, len, try byteOffsetPtr(l, slot, 8));
+    return .{ .value = slot, .zty = slice_zty };
 }
 
 fn lowerWriterSlice(l: *L, node: Ast.Node.Index) Error!TypedValue {
@@ -1878,15 +1926,7 @@ fn lowerWriterSlice(l: *L, node: Ast.Node.Index) Error!TypedValue {
         if (value.zty == .ptr and value.zty.ptr.* == .array and
             value.zty.ptr.array.elem.* == .int and value.zty.ptr.array.elem.int.bits == 8)
         {
-            const elem = value.zty.ptr.array.elem;
-            const slice_zty = ZType{ .slice = elem };
-            const ptr_ty = try l.func.types.ptrGlobal();
-            const slice = try l.func.appendInst(l.block, ptr_ty, .{ .alloca = .{ .elem = try slice_zty.irType(l.func) } });
-            const len_ty = try l.func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
-            const len = try l.func.appendInst(l.block, len_ty, .{ .iconst = @intCast(value.zty.ptr.array.len) });
-            try l.func.appendStore(l.block, value.value, slice);
-            try l.func.appendStore(l.block, len, try byteOffsetPtr(l, slice, 8));
-            return .{ .value = slice, .zty = slice_zty };
+            return packSlice(l, value.zty.ptr.array.elem, value.value, value.zty.ptr.array.len);
         }
         return Error.UnsupportedType;
     }
@@ -2413,7 +2453,7 @@ fn lowerCall(l: *L, node: Ast.Node.Index) Error!?TypedValue {
         }
     }
 
-    if (sig.ret) |rz| if (rz == .optional_value) {
+    if (sig.ret) |rz| if (rz == .optional_value or rz == .slice) {
         const slot = try optionalSlot(l, rz);
         if (rz.optionalPayloadIsAggregate() and rz.byteSize() > 16) {
             if (l.r.target != .aarch64) return Error.UnsupportedType;
@@ -2639,6 +2679,23 @@ fn lowerVaListAddr(l: *L, node: Ast.Node.Index) Error!Value {
     return v.value;
 }
 
+fn lowerCharLiteral(l: *L, node: Ast.Node.Index, expected: ?ZType) Error!TypedValue {
+    const text = l.r.tree.tokenSlice(l.r.tree.nodeMainToken(node));
+    const res = std.zig.string_literal.parseCharLiteral(text);
+    const cp: u32 = switch (res) {
+        .success => |c| c,
+        .failure => return Error.UnsupportedNode,
+    };
+    const zty = expected orelse ZType{ .int = .{ .signed = false, .bits = 8 } };
+    if (zty != .int) return Error.TypeMismatch;
+    if (zty.int.bits < 32) {
+        const limit = (@as(u64, 1) << @intCast(zty.int.bits));
+        if (cp >= limit) return Error.IntegerOverflow;
+    }
+    const irty = try zty.irType(l.func);
+    return .{ .value = try l.func.appendInst(l.block, irty, .{ .iconst = cp }), .zty = zty };
+}
+
 fn lowerNumberLiteral(l: *L, node: Ast.Node.Index, expected: ?ZType) Error!TypedValue {
     const text = l.r.tree.tokenSlice(l.r.tree.nodeMainToken(node));
     const res = std.zig.number_literal.parseNumberLiteral(text);
@@ -2826,6 +2883,68 @@ fn importedIntegerConstant(l: *L, node: Ast.Node.Index, expected: ?ZType) Error!
     }
     return .{ .value = try l.func.appendInst(l.block, try zty.irType(l.func), .{ .iconst = value }), .zty = zty };
 }
+fn lowerSliceExpr(l: *L, node: Ast.Node.Index) Error!TypedValue {
+    const tree = l.r.tree;
+    const slice_info: Ast.full.Slice = switch (tree.nodeTag(node)) {
+        .slice_open => tree.sliceOpen(node),
+        .slice => tree.slice(node),
+        .slice_sentinel => tree.sliceSentinel(node),
+        else => return Error.UnsupportedNode,
+    };
+
+    const base = try lowerExpr(l, slice_info.ast.sliced, null);
+    const elem_zty: *const ZType = switch (base.zty) {
+        .slice => |s| s,
+        .array => |a| a.elem,
+        .ptr => |p| switch (p.*) {
+            .array => |a| a.elem,
+            else => p,
+        },
+        else => return Error.UnsupportedNode,
+    };
+
+    const usize_ty = try l.func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+    const ptr_ty = try l.func.types.ptrGlobal();
+
+    // Determine the base pointer and total length (if known/slice)
+    const base_ptr: Value = if (base.zty == .slice)
+        try l.func.appendInst(l.block, ptr_ty, .{ .load = .{ .ptr = base.value } })
+    else
+        base.value;
+
+    const start_val = try lowerExpr(l, slice_info.ast.start, ZType{ .int = .{ .signed = false, .bits = 64 } });
+    const start_i64 = try toI64(l, start_val);
+    const start_usize = if (start_val.zty.int.bits == 64 and !start_val.zty.int.signed)
+        start_val.value
+    else
+        try l.func.appendInst(l.block, usize_ty, .{ .convert = .{ .value = start_val.value } });
+
+    const sub_ptr = try indexPtr(l, base_ptr, start_i64, elem_zty.byteSize());
+
+    const sub_len: Value = if (slice_info.ast.end.unwrap()) |end_node| blk: {
+        const end_val = try lowerExpr(l, end_node, ZType{ .int = .{ .signed = false, .bits = 64 } });
+        const end_usize = if (end_val.zty.int.bits == 64 and !end_val.zty.int.signed)
+            end_val.value
+        else
+            try l.func.appendInst(l.block, usize_ty, .{ .convert = .{ .value = end_val.value } });
+        break :blk try l.func.appendInst(l.block, usize_ty, .{ .arith = .{ .op = .sub, .lhs = end_usize, .rhs = start_usize } });
+    } else blk: {
+        // [start..] open slice: length is total_len - start
+        const total_len: Value = switch (base.zty) {
+            .slice => try l.func.appendInst(l.block, usize_ty, .{ .load = .{ .ptr = try byteOffsetPtr(l, base.value, 8) } }),
+            .array => |a| try l.func.appendInst(l.block, usize_ty, .{ .iconst = @intCast(a.len) }),
+            .ptr => |p| switch (p.*) {
+                .array => |a| try l.func.appendInst(l.block, usize_ty, .{ .iconst = @intCast(a.len) }),
+                else => return Error.UnsupportedNode,
+            },
+            else => return Error.UnsupportedNode,
+        };
+        break :blk try l.func.appendInst(l.block, usize_ty, .{ .arith = .{ .op = .sub, .lhs = total_len, .rhs = start_usize } });
+    };
+
+    return packSlice(l, elem_zty, sub_ptr, sub_len);
+}
+
 fn lowerStringLiteral(l: *L, node: Ast.Node.Index, expected: ?ZType) Error!TypedValue {
     const tree = l.r.tree;
     const slice_type = if (expected) |ty| ty else blk: {
@@ -2985,6 +3104,7 @@ fn lowerExpr(l: *L, node: Ast.Node.Index, expected: ?ZType) Error!TypedValue {
         return packOptional(l, zty, value);
     };
     switch (tree.nodeTag(node)) {
+        .char_literal => return lowerCharLiteral(l, node, expected),
         .string_literal => return lowerStringLiteral(l, node, expected),
         .number_literal => return lowerNumberLiteral(l, node, expected),
         .error_value => return lowerErrorValue(l, node, expected),
@@ -3023,6 +3143,7 @@ fn lowerExpr(l: *L, node: Ast.Node.Index, expected: ?ZType) Error!TypedValue {
             return loadOrDecay(l, try lowerAddr(l, node));
         },
         .deref, .array_access, .field_access => return loadOrDecay(l, try lowerAddr(l, node)),
+        .slice_open, .slice, .slice_sentinel => return lowerSliceExpr(l, node),
         .unwrap_optional => {
             const optional = try lowerExpr(l, tree.nodeData(node).node_and_token[0], null);
             if (optional.zty != .optional_ptr and optional.zty != .optional_value) return Error.TypeMismatch;
@@ -3112,7 +3233,13 @@ fn lowerExpr(l: *L, node: Ast.Node.Index, expected: ?ZType) Error!TypedValue {
             const a = try lowerAddr(l, d);
             const p = try l.r.arena.create(ZType);
             p.* = a.zty;
-            return .{ .value = a.value, .zty = ZType{ .ptr = p } };
+            const ptr_val = TypedValue{ .value = a.value, .zty = ZType{ .ptr = p } };
+            if (expected) |exp| {
+                if (exp == .slice and a.zty == .array and a.zty.array.elem.eql(exp.slice.*)) {
+                    return convertTo(l, ptr_val, exp);
+                }
+            }
+            return ptr_val;
         },
         else => return Error.UnsupportedNode,
     }
@@ -3323,6 +3450,23 @@ fn lowerStmt(l: *L, stmt: Ast.Node.Index) Error!bool {
                 if (zty != .strct) return Error.UnsupportedType;
                 const addr = try declareLocal(l, name, zty, null);
                 try lowerStructInitInto(l, init_node, addr, zty.strct);
+                return false;
+            }
+
+            if (isArrayInitTag(tree.nodeTag(init_node))) {
+                var buf2: [2]Ast.Node.Index = undefined;
+                const ai = tree.fullArrayInit(&buf2, init_node) orelse return Error.UnsupportedNode;
+                const zty = if (type_node) |tn| try resolveType(l.r, tn) else blk: {
+                    const te = ai.ast.type_expr.unwrap() orelse return Error.UnsupportedType;
+                    var parsed_ty = try resolveType(l.r, te);
+                    if (parsed_ty == .array and parsed_ty.array.len == 0) {
+                        parsed_ty.array.len = ai.ast.elements.len;
+                    }
+                    break :blk parsed_ty;
+                };
+                if (zty != .array) return Error.UnsupportedType;
+                const addr = try declareLocal(l, name, zty, null);
+                try lowerArrayInitInto(l, init_node, addr, zty.array);
                 return false;
             }
 
@@ -3547,9 +3691,13 @@ fn lowerStmt(l: *L, stmt: Ast.Node.Index) Error!bool {
             const rz = l.ret_zty orelse return Error.TypeMismatch;
             const v = try lowerExpr(l, ret_node.?, rz);
             try emitDeferredVaEnds(l);
-            if (rz == .optional_value) {
+            if (rz == .optional_value or rz == .slice) {
                 if (l.sret_ptr) |dest| {
-                    try copyOptional(l, rz, dest, v.value);
+                    if (rz == .optional_value) {
+                        try copyOptional(l, rz, dest, v.value);
+                    } else {
+                        try copyAggregateBytes(l, dest, v.value, rz.byteSize());
+                    }
                     l.func.setTerminator(l.block, .{ .ret = ir.function.Ret.one(dest) });
                 } else {
                     var chunks: [2]Value = undefined;
@@ -3579,7 +3727,11 @@ fn lowerStmt(l: *L, stmt: Ast.Node.Index) Error!bool {
                 try lowerStructInitInto(l, d[1], addr.value, addr.zty.strct);
                 return false;
             }
-            if (addr.zty == .array) return Error.UnsupportedNode;
+            if (addr.zty == .array) {
+                if (!isArrayInitTag(tree.nodeTag(d[1]))) return Error.UnsupportedNode;
+                try lowerArrayInitInto(l, d[1], addr.value, addr.zty.array);
+                return false;
+            }
             if (addr.zty == .optional_value) {
                 const v = try lowerExpr(l, d[1], addr.zty);
                 try copyOptional(l, addr.zty, addr.value, v.value);
@@ -3739,7 +3891,7 @@ fn lowerFunction(gpa: std.mem.Allocator, ctx: *Ctx, proto_node: Ast.Node.Index, 
     var ret_zty: ?ZType = null;
     if (!isVoidType(tree, ret_node) and !is_noreturn) {
         const rz = try resolveType(ctx, ret_node);
-        if ((rz.isAggregate() and rz != .optional_value and rz != .error_union) or (rz.optionalPayloadIsAggregate() and (ctx.target != .aarch64 or rz.byteSize() <= 16))) return Error.UnsupportedType;
+        if ((rz.isAggregate() and rz != .optional_value and rz != .slice and rz != .error_union) or (rz.optionalPayloadIsAggregate() and (ctx.target != .aarch64 or rz.byteSize() <= 16))) return Error.UnsupportedType;
         ret_zty = rz;
     }
     if (ret_zty) |ret| {
@@ -4023,7 +4175,7 @@ fn lowerRoot(gpa: std.mem.Allocator, arena: std.mem.Allocator, tree: *const Ast,
         var ret: ?ZType = null;
         if (!isVoidType(tree, ret_node) and !is_noreturn) {
             const rz = try resolveType(&ctx, ret_node);
-            if ((rz.isAggregate() and rz != .optional_value and rz != .error_union) or (rz.optionalPayloadIsAggregate() and (target != .aarch64 or rz.byteSize() <= 16))) return Error.UnsupportedType;
+            if ((rz.isAggregate() and rz != .optional_value and rz != .slice and rz != .error_union) or (rz.optionalPayloadIsAggregate() and (target != .aarch64 or rz.byteSize() <= 16))) return Error.UnsupportedType;
             if (rz == .error_union and (target != .aarch64 or rz.byteSize() <= 16)) return Error.UnsupportedType;
             ret = rz;
         }
