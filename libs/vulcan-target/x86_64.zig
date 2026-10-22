@@ -4,6 +4,7 @@
 const std = @import("std");
 
 pub const encode = @import("x86_64/encode.zig");
+pub const decode = @import("x86_64/decode.zig");
 pub const disasm = @import("x86_64/disasm.zig");
 pub const isel = @import("x86_64/isel.zig");
 pub const link = @import("x86_64/link.zig");

@@ -1,14 +1,20 @@
 //! x86-64 disassembler for the subset `encode.zig` emits. Unlike the fixed-width RISC
 //! backends, x86 is variable length, so the decoder parses the real instruction structure
-//! (legacy/mandatory prefix, REX or 3-byte VEX, 0F/0F3A opcode escape, ModRM+SIB+disp,
+//! (legacy/mandatory prefix, REX or 3-byte VEX, 0F/0F38/0F3A opcode escape, ModRM+SIB+disp,
 //! immediate) to both render the instruction AND compute its length, which is how it steps
 //! through a byte stream. Anything outside the emitted subset prints as `.byte 0x<hex>`.
+//!
+//! The parsing lives in `decode.zig`, which yields a typed instruction; this file is the
+//! rendering of that type.
 //!
 //! `format` renders a whole code buffer; `disasmInst` decodes one instruction and reports
 //! its length. Validated by round-tripping every encoder function.
 
 const std = @import("std");
 const encode = @import("encode.zig");
+const decoder = @import("decode.zig");
+
+const Size = decoder.Size;
 
 pub fn format(allocator: std.mem.Allocator, code: []const u8) std.mem.Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
@@ -99,646 +105,427 @@ const gpr8 = [_][]const u8{
     "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b",
 };
 
-/// A general register at the instruction's operand size: 64-bit with REX.W, 16-bit with a 0x66
-/// prefix, else 32-bit (the 64-bit-mode default). Addresses always use the 64-bit names.
-fn rv(d: *const D, n: u8) []const u8 {
-    if (d.rexW) return gpr[n];
-    if (d.mand == 0x66) return gpr16[n];
-    return gpr32[n];
-}
-
-/// A general register that is 64-bit with REX.W else 32-bit, ignoring a 0x66 that is a mandatory
-/// SSE prefix (movd/movq, cvtsi2ss, cvttss2si) rather than an operand-size override.
-fn rvq(d: *const D, n: u8) []const u8 {
-    return if (d.rexW) gpr[n] else gpr32[n];
-}
-
-fn xmm(a: std.mem.Allocator, b: *std.ArrayList(u8), n: u8) !void {
-    try b.print(a, "xmm{d}", .{n});
-}
-
-/// Decoder cursor + parsed prefix/REX/VEX state.
-const D = struct {
-    code: []const u8,
-    i: usize,
-    mand: u8 = 0, // mandatory/legacy prefix (0x66/0xF2/0xF3), 0 = none
-    rexW: bool = false,
-    R: u8 = 0, // ModRM.reg extension bit (REX.R / VEX)
-    X: u8 = 0, // SIB.index extension bit (REX.X / VEX)
-    B: u8 = 0, // ModRM.rm / base extension bit
-    vex: bool = false,
-    vvvv: u8 = 0, // VEX source-1 register
-    esc: u16 = 0, // opcode map: 0 (1-byte), 0x0F, 0x38, 0x3A
-
-    fn byte(d: *D) u8 {
-        const b = if (d.i < d.code.len) d.code[d.i] else 0;
-        d.i += 1;
-        return b;
-    }
-    fn peek(d: *D) u8 {
-        return if (d.i < d.code.len) d.code[d.i] else 0;
-    }
-    fn imm32(d: *D) i32 {
-        const u: u32 = @as(u32, d.byte()) | (@as(u32, d.byte()) << 8) | (@as(u32, d.byte()) << 16) | (@as(u32, d.byte()) << 24);
-        return @bitCast(u);
-    }
-    fn imm64(d: *D) u64 {
-        var u: u64 = 0;
-        inline for (0..8) |k| u |= @as(u64, d.byte()) << (k * 8);
-        return u;
-    }
-};
-
-fn decode(a: std.mem.Allocator, b: *std.ArrayList(u8), code: []const u8, pos: usize) !usize {
-    var d = D{ .code = code, .i = pos };
-
-    // Legacy prefixes: 0x66/0xF2/0xF3 are mandatory/operand-size (recorded); segment overrides,
-    // address-size, and lock are consumed so the stream stays in sync.
-    while (true) switch (d.peek()) {
-        0x66, 0xF2, 0xF3 => d.mand = d.byte(),
-        0x2E, 0x36, 0x3E, 0x26, 0x64, 0x65, 0x67, 0xF0 => _ = d.byte(),
-        else => break,
+/// A general register at the given operand size. Addresses always use the 64-bit names.
+fn regName(size: Size, n: u8) []const u8 {
+    return switch (size) {
+        .byte => gpr8[n & 15],
+        .word => gpr16[n & 15],
+        .dword => gpr32[n & 15],
+        else => gpr[n & 15],
     };
-
-    if (d.peek() == 0xC4) { // 3-byte VEX
-        _ = d.byte();
-        const byte2 = d.byte();
-        const byte3 = d.byte();
-        d.vex = true;
-        d.R = ((byte2 >> 7) & 1) ^ 1;
-        d.X = ((byte2 >> 6) & 1) ^ 1;
-        d.B = ((byte2 >> 5) & 1) ^ 1;
-        d.esc = switch (byte2 & 0x1F) {
-            1 => 0x0F,
-            2 => 0x38,
-            3 => 0x3A,
-            else => 0x0F,
-        };
-        d.rexW = (byte3 >> 7) & 1 != 0;
-        d.vvvv = (~(byte3 >> 3)) & 0xF;
-        d.mand = switch (byte3 & 3) {
-            1 => 0x66,
-            2 => 0xF3,
-            3 => 0xF2,
-            else => 0,
-        };
-    } else {
-        if (d.peek() & 0xF0 == 0x40) { // REX
-            const rex = d.byte();
-            d.rexW = rex & 8 != 0;
-            d.R = (rex >> 2) & 1;
-            d.X = (rex >> 1) & 1;
-            d.B = rex & 1;
-        }
-        if (d.peek() == 0x0F) {
-            _ = d.byte();
-            d.esc = 0x0F;
-            if (d.peek() == 0x38 or d.peek() == 0x3A) d.esc = d.byte();
-        }
-    }
-
-    const op = d.byte();
-    try dispatch(a, b, &d, op);
-    return d.i - pos;
 }
 
-/// ModRM operands: returns reg (with the R extension) and, for a register-direct rm, the rm
-/// register; for a memory rm it records base+disp and advances past SIB/disp.
-const Operands = struct {
-    reg: u8,
-    mod: u8,
-    rm: u8, // register number (direct) or base register (memory)
-    mem: bool,
-    disp: i32,
-    index: u8 = 16, // SIB index register, 16 = none
-    scale: u8 = 1, // SIB scale (1/2/4/8)
-};
-
-fn modrm(d: *D) Operands {
-    const m = d.byte();
-    const mod = m >> 6;
-    const reg = (d.R << 3) | ((m >> 3) & 7);
-    var rm = (d.B << 3) | (m & 7);
-    if (mod == 3) return .{ .reg = reg, .mod = mod, .rm = rm, .mem = false, .disp = 0 };
-    var index: u8 = 16;
-    var scale: u8 = 1;
-    // Memory operand. A base of rsp/r12 (low bits 100) carries a SIB byte.
-    if ((m & 7) == 4) {
-        const sib = d.byte();
-        rm = (d.B << 3) | (sib & 7); // base
-        const idx = (d.X << 3) | ((sib >> 3) & 7);
-        if (idx != 4) { // index 100 with no REX.X means "no index register"
-            index = idx;
-            scale = @as(u8, 1) << @intCast(sib >> 6);
-        }
-    }
-    var disp: i32 = 0;
-    if (mod == 1) {
-        disp = @as(i8, @bitCast(d.byte()));
-    } else if (mod == 2 or (mod == 0 and (m & 7) == 5)) {
-        disp = d.imm32();
-    }
-    return .{ .reg = reg, .mod = mod, .rm = rm, .mem = true, .disp = disp, .index = index, .scale = scale };
+/// A general register that is 64-bit with REX.W else 32-bit, ignoring a 0x66 that is a
+/// mandatory SSE prefix (movd/movq, cvtsi2ss, cvttss2si) rather than an operand-size
+/// override.
+fn regNameWide(wide: bool, n: u8) []const u8 {
+    return if (wide) gpr[n & 15] else gpr32[n & 15];
 }
 
-/// The `<size> ptr ` hint llvm prints before a memory operand, at the operand size.
-fn ptrHint(d: *const D) []const u8 {
-    if (d.rexW) return "qword ptr ";
-    if (d.mand == 0x66) return "word ptr ";
-    return "dword ptr ";
+/// The `<size> ptr ` hint llvm prints before a memory operand.
+fn hintText(size: Size) []const u8 {
+    return switch (size) {
+        .byte => "byte ptr ",
+        .word => "word ptr ",
+        .dword => "dword ptr ",
+        .qword => "qword ptr ",
+        .xmmword => "xmmword ptr ",
+        .ymmword => "ymmword ptr ",
+    };
 }
 
 /// Render a memory operand `<hint>[base + index*scale + disp]`. Address registers are 64-bit.
-fn memHint(a: std.mem.Allocator, b: *std.ArrayList(u8), o: Operands, hint: []const u8) !void {
-    try b.print(a, "{s}[{s}", .{ hint, gpr[o.rm] });
-    if (o.index != 16) {
-        if (o.scale == 1) {
-            try b.print(a, " + {s}", .{gpr[o.index]});
-        } else {
-            try b.print(a, " + {d}*{s}", .{ o.scale, gpr[o.index] });
-        }
+fn memText(a: std.mem.Allocator, b: *std.ArrayList(u8), m: decoder.Mem, hint: ?Size) !void {
+    if (hint) |h| try b.appendSlice(a, hintText(h));
+    if (m.base == null and m.index == null and !m.rip) {
+        // A displacement with no base and no index: an absolute address.
+        try b.print(a, "[{d}]", .{m.disp});
+        return;
     }
-    if (o.disp != 0) try b.print(a, " {s} {d}", .{ if (o.disp < 0) "-" else "+", @abs(o.disp) });
+    try b.append(a, '[');
+    if (m.rip) {
+        try b.appendSlice(a, "rip");
+    } else if (m.base) |r| {
+        try b.appendSlice(a, gpr[@backingInt(r)]);
+    }
+    if (m.index) |ix| {
+        try b.appendSlice(a, " + ");
+        if (m.scale != 1) try b.print(a, "{d}*", .{m.scale});
+        try b.appendSlice(a, gpr[@backingInt(ix)]);
+    }
+    if (m.disp != 0) try b.print(a, " {s} {d}", .{ if (m.disp < 0) "-" else "+", @abs(m.disp) });
     try b.append(a, ']');
 }
 
-/// A memory operand with no size hint (the default for callers that pass a register too).
-fn memOperand(a: std.mem.Allocator, b: *std.ArrayList(u8), o: Operands) !void {
-    try memHint(a, b, o, "");
-}
-
-fn dispatch(a: std.mem.Allocator, b: *std.ArrayList(u8), d: *D, op: u8) !void {
-    if (d.vex) return vexOp(a, b, d, op);
-    if (d.esc == 0x0F) return twoByte(a, b, d, op);
-    if (d.esc == 0x3A) return threeByteA(a, b, d, op);
-
-    // One-byte opcodes.
-    switch (op) {
-        0x01, 0x09, 0x21, 0x29, 0x31, 0x39, 0x85, 0x89 => {
-            const mnem: []const u8 = switch (op) {
-                0x01 => "add",
-                0x09 => "or",
-                0x21 => "and",
-                0x29 => "sub",
-                0x31 => "xor",
-                0x39 => "cmp",
-                0x85 => "test",
-                0x89 => "mov",
-                else => unreachable,
-            };
-            const o = modrm(d);
-            if (o.mem) { // store form: mov [mem], reg
-                try b.print(a, "{s} ", .{mnem});
-                try memHint(a, b, o, ptrHint(d));
-                try b.print(a, ", {s}", .{rv(d, o.reg)});
-            } else {
-                try b.print(a, "{s} {s}, {s}", .{ mnem, rv(d, o.rm), rv(d, o.reg) });
-            }
-        },
-        0x8B, 0x8D => { // mov reg, [mem] (size-hinted) / lea reg, [mem] (address, no hint)
-            const o = modrm(d);
-            try b.print(a, "{s} {s}, ", .{ if (op == 0x8B) "mov" else "lea", rv(d, o.reg) });
-            try memHint(a, b, o, if (op == 0x8B) ptrHint(d) else "");
-        },
-        0xC7 => { // mov r/m, imm32 (/0)
-            const o = modrm(d);
-            const imm = d.imm32();
-            if (o.mem) {
-                try b.appendSlice(a, "mov ");
-                try memHint(a, b, o, ptrHint(d));
-                try b.print(a, ", {d}", .{imm});
-            } else try b.print(a, "mov {s}, {d}", .{ rv(d, o.rm), imm });
-        },
-        0x81 => { // ALU r/m, imm32 (/digit)
-            const o = modrm(d);
-            const imm = d.imm32();
-            const mnem: []const u8 = switch ((o.reg & 7)) {
-                0 => "add",
-                1 => "or",
-                4 => "and",
-                5 => "sub",
-                6 => "xor",
-                else => "alu?",
-            };
-            try b.print(a, "{s} {s}, {d}", .{ mnem, rv(d, o.rm), imm });
-        },
-        0x69 => { // imul reg, r/m, imm32
-            const o = modrm(d);
-            const imm = d.imm32();
-            try b.print(a, "imul {s}, {s}, {d}", .{ rv(d, o.reg), rv(d, o.rm), imm });
-        },
-        0xC1, 0xD3 => { // shift r/m by imm8 / by CL
-            const o = modrm(d);
-            const mnem: []const u8 = switch ((o.reg & 7)) {
-                4 => "shl",
-                5 => "shr",
-                7 => "sar",
-                else => "sh?",
-            };
-            if (op == 0xC1) {
-                try b.print(a, "{s} {s}, {d}", .{ mnem, rv(d, o.rm), d.byte() });
-            } else try b.print(a, "{s} {s}, cl", .{ mnem, rv(d, o.rm) });
-        },
-        0xF7 => { // group 3: test/not/neg/mul/imul/div/idiv r/m
-            const o = modrm(d);
-            switch (o.reg & 7) {
-                0 => try b.print(a, "test {s}, {d}", .{ rv(d, o.rm), d.imm32() }),
-                2 => try b.print(a, "not {s}", .{rv(d, o.rm)}),
-                3 => try b.print(a, "neg {s}", .{rv(d, o.rm)}),
-                4 => try b.print(a, "mul {s}", .{rv(d, o.rm)}),
-                5 => try b.print(a, "imul {s}", .{rv(d, o.rm)}),
-                6 => try b.print(a, "div {s}", .{rv(d, o.rm)}),
-                else => try b.print(a, "idiv {s}", .{rv(d, o.rm)}),
-            }
-        },
-        0x98 => try b.appendSlice(a, if (d.rexW) "cdqe" else "cwde"),
-        0x99 => try b.appendSlice(a, if (d.rexW) "cqo" else "cdq"),
-        0xB8...0xBF => { // mov reg, imm (imm64 with REX.W, else imm32)
-            const r = (d.B << 3) | (op & 7);
-            if (d.rexW) {
-                try b.print(a, "mov {s}, {d}", .{ rv(d, r), d.imm64() });
-            } else {
-                try b.print(a, "mov {s}, {d}", .{ rv(d, r), @as(u32, @bitCast(d.imm32())) });
-            }
-        },
-        0xE8 => {
-            const rel = d.imm32();
-            try b.print(a, "call .{s}{d}", .{ relSign(rel), @abs(rel) });
-        },
-        0xE9 => {
-            const rel = d.imm32();
-            try b.print(a, "jmp .{s}{d}", .{ relSign(rel), @abs(rel) });
-        },
-        0xC3 => try b.appendSlice(a, "ret"),
-        0x90 => try b.appendSlice(a, "nop"), // also the inter-function alignment padding
-
-        // ALU reg <- r/m (the load direction, opcode +3 within each ALU group).
-        0x03, 0x0B, 0x13, 0x1B, 0x23, 0x2B, 0x33, 0x3B => {
-            const o = modrm(d);
-            try b.print(a, "{s} {s}, ", .{ aluName(op >> 3), rv(d, o.reg) });
-            if (o.mem) try memHint(a, b, o, ptrHint(d)) else try b.appendSlice(a, rv(d, o.rm));
-        },
-        // ALU al/eax/rax, imm (opcode +5 within each group).
-        0x05, 0x0D, 0x15, 0x1D, 0x25, 0x2D, 0x35, 0x3D => {
-            try b.print(a, "{s} {s}, {d}", .{ aluName(op >> 3), rv(d, 0), d.imm32() });
-        },
-        0x83 => { // ALU r/m, imm8 (sign-extended), /digit
-            const o = modrm(d);
-            const imm: i32 = @as(i8, @bitCast(d.byte()));
-            try b.print(a, "{s} ", .{aluName(o.reg & 7)});
-            if (o.mem) try memHint(a, b, o, ptrHint(d)) else try b.appendSlice(a, rv(d, o.rm));
-            try b.print(a, ", {d}", .{imm});
-        },
-        0x70...0x7F => { // jcc rel8 (short conditional)
-            const rel: i32 = @as(i8, @bitCast(d.byte()));
-            try b.print(a, "j{s} .{s}{d}", .{ condName(op & 0xF), relSign(rel), @abs(rel) });
-        },
-        0xEB => { // jmp rel8 (short)
-            const rel: i32 = @as(i8, @bitCast(d.byte()));
-            try b.print(a, "jmp .{s}{d}", .{ relSign(rel), @abs(rel) });
-        },
-        0x50...0x57 => try b.print(a, "push {s}", .{gpr[(d.B << 3) | (op & 7)]}), // push r64
-        0x58...0x5F => try b.print(a, "pop {s}", .{gpr[(d.B << 3) | (op & 7)]}), // pop r64
-        0x63 => { // movsxd r64, r/m32
-            const o = modrm(d);
-            try b.print(a, "movsxd {s}, ", .{gpr[o.reg]});
-            if (o.mem) try memHint(a, b, o, "dword ptr ") else try b.appendSlice(a, gpr32[o.rm]);
-        },
-        0xFF => { // group 5: inc/dec/call/jmp/push r/m
-            const o = modrm(d);
-            const digit = o.reg & 7;
-            const mnem: []const u8 = switch (digit) {
-                0 => "inc",
-                1 => "dec",
-                2 => "call",
-                4 => "jmp",
-                6 => "push",
-                else => "grp5?",
-            };
-            try b.print(a, "{s} ", .{mnem});
-            // call/jmp/push through a pointer are 64-bit; inc/dec take the operand size.
-            const hint: []const u8 = if (digit >= 2) "qword ptr " else ptrHint(d);
-            if (o.mem) try memHint(a, b, o, hint) else try b.appendSlice(a, gpr[o.rm]);
-        },
-        0xA8 => try b.print(a, "test al, {d}", .{d.byte()}),
-        0xA9 => try b.print(a, "test {s}, {d}", .{ rv(d, 0), d.imm32() }),
-
-        // Byte ALU: r/m8,r8 (opcode +0) and r8,r/m8 (opcode +2), plus test/mov byte forms.
-        0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x84, 0x88 => { // r/m8, r8
-            const mnem = if (op == 0x84) "test" else if (op == 0x88) "mov" else aluName(op >> 3);
-            const o = modrm(d);
-            try b.print(a, "{s} ", .{mnem});
-            if (o.mem) try memHint(a, b, o, "byte ptr ") else try b.appendSlice(a, gpr8[o.rm]);
-            try b.print(a, ", {s}", .{gpr8[o.reg]});
-        },
-        0x02, 0x0A, 0x12, 0x1A, 0x22, 0x2A, 0x32, 0x3A, 0x8A => { // r8, r/m8
-            const mnem = if (op == 0x8A) "mov" else aluName(op >> 3);
-            const o = modrm(d);
-            try b.print(a, "{s} {s}, ", .{ mnem, gpr8[o.reg] });
-            if (o.mem) try memHint(a, b, o, "byte ptr ") else try b.appendSlice(a, gpr8[o.rm]);
-        },
-        0xC6 => { // mov r/m8, imm8
-            const o = modrm(d);
-            try b.appendSlice(a, "mov ");
-            if (o.mem) try memHint(a, b, o, "byte ptr ") else try b.appendSlice(a, gpr8[o.rm]);
-            try b.print(a, ", {d}", .{d.byte()});
-        },
-        else => try b.print(a, ".byte 0x{x:0>2}", .{op}),
-    }
-}
-
-fn twoByte(a: std.mem.Allocator, b: *std.ArrayList(u8), d: *D, op: u8) !void {
-    // SSE scalar/packed and integer 0F ops, keyed on the mandatory prefix.
-    switch (op) {
-        0x05 => return b.appendSlice(a, "syscall"),
-        0x1F => { // multi-byte nop (0F 1F /r): consume the ModRM so the stream stays synced
-            _ = modrm(d);
-            return b.appendSlice(a, "nop");
-        },
-        0x1E => { // endbr64 (F3 0F 1E FA) / other reserved-nop hints
-            _ = d.byte();
-            return b.appendSlice(a, "endbr64");
-        },
-        0xAF => { // imul reg, r/m
-            const o = modrm(d);
-            try b.print(a, "imul {s}, ", .{rv(d, o.reg)});
-            if (o.mem) return memHint(a, b, o, ptrHint(d));
-            return b.appendSlice(a, rv(d, o.rm));
-        },
-        0x73 => { // group: psrlq/psrldq/psllq/pslldq xmm, imm8 (/digit selects)
-            const o = modrm(d);
-            const imm = d.byte();
-            const mnem: []const u8 = switch (o.reg & 7) {
-                2 => "psrlq",
-                3 => "psrldq",
-                6 => "psllq",
-                else => "pslldq",
-            };
-            return b.print(a, "{s} xmm{d}, {d}", .{ mnem, o.rm, imm });
-        },
-        0xB6, 0xB7, 0xBE, 0xBF => { // movzx / movsx: dst is 32/64-bit, src is 8-bit (B6/BE) or 16-bit
-            const o = modrm(d);
-            const wide = op == 0xB7 or op == 0xBF; // 16-bit source
-            const mnem: []const u8 = if (op == 0xBE or op == 0xBF) "movsx" else "movzx";
-            try b.print(a, "{s} {s}, ", .{ mnem, rv(d, o.reg) });
-            if (o.mem) return memHint(a, b, o, if (wide) "word ptr " else "byte ptr ");
-            return b.appendSlice(a, if (wide) gpr16[o.rm] else gpr8[o.rm]);
-        },
-        0x40...0x4F => { // cmovcc
-            const o = modrm(d);
-            return b.print(a, "cmov{s} {s}, {s}", .{ condName(op & 0xF), rv(d, o.reg), rv(d, o.rm) });
-        },
-        0x90...0x9F => { // setcc r/m8 (a byte register)
-            const o = modrm(d);
-            return b.print(a, "set{s} {s}", .{ condName(op & 0xF), gpr8[o.rm] });
-        },
-        0x80...0x8F => { // jcc rel32
-            const rel = d.imm32();
-            return b.print(a, "j{s} .{s}{d}", .{ condName(op & 0xF), relSign(rel), @abs(rel) });
-        },
-        else => {},
-    }
-
-    // SSE data-movement / arithmetic. movd/movq cross the register files.
-    if (op == 0x6E or op == 0x7E) { // movd/movq xmm<->gpr
-        const o = modrm(d);
-        const mn: []const u8 = if (d.rexW) "movq" else "movd";
-        if (op == 0x6E) { // to xmm: reg=xmm, rm=gpr
-            try b.print(a, "{s} ", .{mn});
-            try xmm(a, b, o.reg);
-            return b.print(a, ", {s}", .{rvq(d, o.rm)});
-        } else { // from xmm: reg=xmm, rm=gpr, dst is the gpr
-            try b.print(a, "{s} {s}, ", .{ mn, rvq(d, o.rm) });
-            return xmm(a, b, o.reg);
-        }
-    }
-    if (op == 0x2A) { // cvtsi2ss/sd xmm, gpr
-        const o = modrm(d);
-        try b.print(a, "{s} ", .{if (d.mand == 0xF2) "cvtsi2sd" else "cvtsi2ss"});
-        try xmm(a, b, o.reg);
-        return b.print(a, ", {s}", .{rvq(d, o.rm)});
-    }
-    if (op == 0x2C) { // cvttss2si/cvttsd2si gpr, xmm
-        const o = modrm(d);
-        try b.print(a, "{s} {s}, ", .{ if (d.mand == 0xF2) "cvttsd2si" else "cvttss2si", rvq(d, o.reg) });
-        return xmm(a, b, o.rm);
-    }
-    if (op == 0x70) { // pshufd xmm, xmm, imm8
-        const o = modrm(d);
-        try b.appendSlice(a, "pshufd ");
-        try xmm(a, b, o.reg);
-        try b.appendSlice(a, ", ");
-        try rmXmmOrMem(a, b, o);
-        return b.print(a, ", {d}", .{d.byte()});
-    }
-
-    // The remaining two-xmm ops (arith, moves, converts, compares).
-    const mnem = sseName(d.mand, op) orelse return b.print(a, ".byte 0x0f{x:0>2}", .{op});
-    const o = modrm(d);
-    try b.print(a, "{s} ", .{mnem});
-    // Store-direction opcodes put the memory/register destination first.
-    const store = op == 0x11 or op == 0x29 or op == 0x7F or op == 0xD6;
-    if (o.mem) {
-        if (store) {
-            try memHint(a, b, o, sseHint(d.mand, op));
-            try b.appendSlice(a, ", ");
-            try xmm(a, b, o.reg);
-        } else {
-            try xmm(a, b, o.reg);
-            try b.appendSlice(a, ", ");
-            try memHint(a, b, o, sseHint(d.mand, op));
-        }
-    } else {
-        try xmm(a, b, o.reg);
-        try b.appendSlice(a, ", ");
-        try xmm(a, b, o.rm);
-    }
-}
-
-fn threeByteA(a: std.mem.Allocator, b: *std.ArrayList(u8), d: *D, op: u8) !void {
-    // 66 0F 3A 21 insertps; 66 0F 3A 22 pinsrd; F3/F2 0F 3A 11 roundss/roundsd (as this
-    // backend emits them).
-    const o = modrm(d);
-    if (op == 0x22) { // pinsrd xmm, gpr32, imm8: crosses register files, like movd
-        try b.appendSlice(a, "pinsrd ");
-        try xmm(a, b, o.reg);
-        try b.print(a, ", {s}, ", .{rvq(d, o.rm)});
-        return b.print(a, "{d}", .{d.byte()});
-    }
-    const mnem: []const u8 = if (op == 0x21) "insertps" else if (d.mand == 0xF2) "roundsd" else "roundss";
-    try b.print(a, "{s} ", .{mnem});
-    try xmm(a, b, o.reg);
-    try b.appendSlice(a, ", ");
-    try xmm(a, b, o.rm);
-    try b.print(a, ", {d}", .{d.byte()});
-}
-
-fn vexOp(a: std.mem.Allocator, b: *std.ArrayList(u8), d: *D, op: u8) !void {
-    if (d.esc == 0x3A) { // vinsertf128 (0x18) / vextractf128 (0x19)
-        const o = modrm(d);
-        const imm = d.byte();
-        if (op == 0x18) {
-            try b.appendSlice(a, "vinsertf128 ");
-            try ymm(a, b, o.reg);
-            try b.appendSlice(a, ", ");
-            try ymm(a, b, d.vvvv);
-            try b.appendSlice(a, ", ");
-            try xmm(a, b, o.rm);
-        } else {
-            try b.appendSlice(a, "vextractf128 ");
-            try xmm(a, b, o.rm);
-            try b.appendSlice(a, ", ");
-            try ymm(a, b, o.reg);
-        }
-        return b.print(a, ", {d}", .{imm});
-    }
-    const o = modrm(d);
-    const mnem: []const u8 = switch (op) {
-        0x58 => "vaddps",
-        0x5C => "vsubps",
-        0x59 => "vmulps",
-        0x5E => "vdivps",
-        0x10 => "vmovups",
-        0x11 => "vmovups",
-        else => "vex?",
-    };
-    if (o.mem) { // vmovups spill/reload
-        try b.print(a, "{s} ", .{mnem});
-        if (op == 0x11) {
-            try memOperand(a, b, o);
-            try b.appendSlice(a, ", ");
-            try ymm(a, b, o.reg);
-        } else {
-            try ymm(a, b, o.reg);
-            try b.appendSlice(a, ", ");
-            try memOperand(a, b, o);
-        }
+/// Render an immediate, signed when the processor sign-extends it.
+fn immText(a: std.mem.Allocator, b: *std.ArrayList(u8), imm: decoder.Imm) !void {
+    if (!imm.sign_extended) {
+        try b.print(a, "{d}", .{imm.value});
         return;
     }
-    try b.print(a, "{s} ", .{mnem});
-    try ymm(a, b, o.reg);
-    // Three-operand forms carry src1 in vvvv; the two-operand vmovups does not.
-    if (op != 0x10 and op != 0x11) {
-        try b.appendSlice(a, ", ");
-        try ymm(a, b, d.vvvv);
+    const v: i64 = switch (imm.bits) {
+        8 => @as(i8, @bitCast(@as(u8, @truncate(imm.value)))),
+        16 => @as(i16, @bitCast(@as(u16, @truncate(imm.value)))),
+        32 => @as(i32, @bitCast(@as(u32, @truncate(imm.value)))),
+        else => @bitCast(imm.value),
+    };
+    try b.print(a, "{d}", .{v});
+}
+
+fn destText(a: std.mem.Allocator, b: *std.ArrayList(u8), d: decoder.Dest, size: Size) !void {
+    switch (d) {
+        .reg => |r| try b.appendSlice(a, regName(size, @backingInt(r))),
+        .mem => |m| try memText(a, b, m, size),
     }
-    try b.appendSlice(a, ", ");
-    try ymm(a, b, o.rm);
 }
 
-fn ymm(a: std.mem.Allocator, b: *std.ArrayList(u8), n: u8) !void {
-    try b.print(a, "ymm{d}", .{n});
+fn srcText(a: std.mem.Allocator, b: *std.ArrayList(u8), s: decoder.Src, size: Size) !void {
+    switch (s) {
+        .reg => |r| try b.appendSlice(a, regName(size, @backingInt(r))),
+        .mem => |m| try memText(a, b, m, size),
+        .imm => |i| try immText(a, b, i),
+    }
 }
 
-fn rmXmmOrMem(a: std.mem.Allocator, b: *std.ArrayList(u8), o: Operands) !void {
-    if (o.mem) return memOperand(a, b, o);
-    return xmm(a, b, o.rm);
+/// A branch target: a displacement from the end of the instruction, a register, or a
+/// memory operand.
+fn targetText(a: std.mem.Allocator, b: *std.ArrayList(u8), t: decoder.Target) !void {
+    switch (t) {
+        .rel => |rel| try b.print(a, ".{s}{d}", .{ relSign(rel), @abs(rel) }),
+        .reg => |r| try b.appendSlice(a, gpr[@backingInt(r)]),
+        .mem => |m| try memText(a, b, m, .qword),
+    }
 }
 
-fn sseName(mand: u8, op: u8) ?[]const u8 {
-    return switch (mand) {
-        0xF3 => switch (op) {
-            0x10, 0x11 => "movss",
-            0x58 => "addss",
-            0x59 => "mulss",
-            0x5C => "subss",
-            0x5E => "divss",
-            0x51 => "sqrtss",
-            0x5A => "cvtss2sd",
-            0x6F, 0x7F => "movdqu",
-            else => null,
-        },
-        0xF2 => switch (op) {
-            0x10, 0x11 => "movsd",
-            0x58 => "addsd",
-            0x59 => "mulsd",
-            0x5C => "subsd",
-            0x5E => "divsd",
-            0x51 => "sqrtsd",
-            0x5A => "cvtsd2ss",
-            else => null,
-        },
-        0x66 => switch (op) {
-            0x2E => "ucomisd",
-            0x28, 0x29 => "movapd",
-            0x6F, 0x7F => "movdqa",
-            0xEF => "pxor",
-            0xDB => "pand",
-            0xEB => "por",
-            0xDF => "pandn",
-            0xD4 => "paddq",
-            0xFB => "psubq",
-            0xFE => "paddd",
-            0xFA => "psubd",
-            0xF4 => "pmuludq",
-            0xD5 => "pmullw",
-            0xFC => "paddb",
-            0xFD => "paddw",
-            0xEC => "paddsb",
-            0xED => "paddsw",
-            0xE2 => "psrad",
-            0xD6 => "movq",
-            else => null,
-        },
-        else => switch (op) { // no mandatory prefix: packed / other
-            0x10, 0x11 => "movups",
-            0x58 => "addps",
-            0x59 => "mulps",
-            0x5C => "subps",
-            0x5E => "divps",
-            0x2E => "ucomiss",
-            0x28, 0x29 => "movaps",
-            else => null,
-        },
+/// The ALU mnemonic for an operation.
+fn aluName(op: decoder.AluOp) []const u8 {
+    return switch (op) {
+        .add => "add",
+        .@"or" => "or",
+        .adc => "adc",
+        .sbb => "sbb",
+        .@"and" => "and",
+        .sub => "sub",
+        .xor => "xor",
+        .cmp => "cmp",
+        .@"test" => "test",
     };
 }
 
-/// The `<size> ptr ` hint for an SSE memory operand: a scalar single is dword, a scalar double is
-/// qword, everything packed/integer (incl. movdqu/movdqa where F3/66 are mandatory) is xmmword.
-fn sseHint(mand: u8, op: u8) []const u8 {
-    const scalar = switch (op) {
-        0x10, 0x11, 0x51, 0x58, 0x59, 0x5A, 0x5C, 0x5E, 0x2A, 0x2C, 0x2E => true,
-        else => false,
-    };
-    if (scalar and mand == 0xF3) return "dword ptr ";
-    if (scalar and mand == 0xF2) return "qword ptr ";
-    return "xmmword ptr ";
-}
-
-/// The ALU mnemonic for an opcode group index (bits[5:3] of the opcode, or a /digit).
-fn aluName(g: u8) []const u8 {
-    return switch (g & 7) {
-        0 => "add",
-        1 => "or",
-        2 => "adc",
-        3 => "sbb",
-        4 => "and",
-        5 => "sub",
-        6 => "xor",
-        else => "cmp",
+fn unaryName(op: decoder.UnaryOp) []const u8 {
+    return switch (op) {
+        .not => "not",
+        .neg => "neg",
+        .mul => "mul",
+        .imul => "imul",
+        .div => "div",
+        .idiv => "idiv",
     };
 }
 
-fn condName(cc: u8) []const u8 {
+fn shiftName(op: decoder.ShiftOp) []const u8 {
+    return switch (op) {
+        .rol => "rol",
+        .ror => "ror",
+        .rcl => "rcl",
+        .rcr => "rcr",
+        .shl => "shl",
+        .shr => "shr",
+        .sar => "sar",
+    };
+}
+
+fn condName(cc: decoder.Cond) []const u8 {
     return switch (cc) {
-        0x4 => "e",
-        0x5 => "ne",
-        0xC => "l",
-        0xD => "ge",
-        0xE => "le",
-        0xF => "g",
-        0x2 => "b",
-        0x3 => "ae",
-        0x6 => "be",
-        0x7 => "a",
-        0xA => "p",
-        0xB => "np",
-        else => "?",
+        .o => "o",
+        .no => "no",
+        .b => "b",
+        .ae => "ae",
+        .e => "e",
+        .ne => "ne",
+        .be => "be",
+        .a => "a",
+        .s => "s",
+        .ns => "ns",
+        .p => "p",
+        .np => "np",
+        .l => "l",
+        .ge => "ge",
+        .le => "le",
+        .g => "g",
     };
 }
 
 fn relSign(v: i32) []const u8 {
     return if (v < 0) "-" else "+";
+}
+
+/// Render one decoded instruction.
+fn render(a: std.mem.Allocator, b: *std.ArrayList(u8), inst: decoder.Instruction) !void {
+    switch (inst) {
+        .nop => try b.appendSlice(a, "nop"),
+        .pause => try b.appendSlice(a, "pause"),
+        .hlt => try b.appendSlice(a, "hlt"),
+        .cli => try b.appendSlice(a, "cli"),
+        .sti => try b.appendSlice(a, "sti"),
+        .cld => try b.appendSlice(a, "cld"),
+        .std => try b.appendSlice(a, "std"),
+        .ret => try b.appendSlice(a, "ret"),
+        .syscall => try b.appendSlice(a, "syscall"),
+        .endbr64 => try b.appendSlice(a, "endbr64"),
+        .widen => |w| try b.appendSlice(a, switch (w) {
+            .cdq => "cdq",
+            .cqo => "cqo",
+            .cwde => "cwde",
+            .cdqe => "cdqe",
+        }),
+
+        .mov => |m| {
+            try b.appendSlice(a, "mov ");
+            try destText(a, b, m.dest, m.size);
+            try b.appendSlice(a, ", ");
+            try srcText(a, b, m.src, m.size);
+        },
+        .movzx => |m| {
+            try b.appendSlice(a, "movzx ");
+            try b.appendSlice(a, regName(m.dest_size, @backingInt(m.dest)));
+            try b.appendSlice(a, ", ");
+            switch (m.src) {
+                .reg => |r| try b.appendSlice(a, regName(m.src_size, @backingInt(r))),
+                .mem => |mem| try memText(a, b, mem, m.src_size),
+                .imm => |i| try immText(a, b, i),
+            }
+        },
+        .movsx => |m| {
+            try b.appendSlice(a, "movsx ");
+            try b.appendSlice(a, regName(m.dest_size, @backingInt(m.dest)));
+            try b.appendSlice(a, ", ");
+            switch (m.src) {
+                .reg => |r| try b.appendSlice(a, regName(m.src_size, @backingInt(r))),
+                .mem => |mem| try memText(a, b, mem, m.src_size),
+                .imm => |i| try immText(a, b, i),
+            }
+        },
+        .movsxd => |m| {
+            try b.appendSlice(a, "movsxd ");
+            try b.appendSlice(a, gpr[@backingInt(m.dest)]);
+            try b.appendSlice(a, ", ");
+            switch (m.src) {
+                .reg => |r| try b.appendSlice(a, gpr32[@backingInt(r)]),
+                .mem => |mem| try memText(a, b, mem, .dword),
+                .imm => |i| try immText(a, b, i),
+            }
+        },
+        .lea => |m| {
+            try b.appendSlice(a, "lea ");
+            try b.appendSlice(a, gpr[@backingInt(m.dest)]);
+            try b.appendSlice(a, ", ");
+            try memText(a, b, m.mem, null);
+        },
+
+        .push => |m| {
+            try b.appendSlice(a, "push ");
+            try srcText(a, b, m.src, m.size);
+        },
+        .pop => |m| {
+            try b.appendSlice(a, "pop ");
+            try destText(a, b, m.dest, m.size);
+        },
+
+        .alu => |m| {
+            try b.print(a, "{s} ", .{aluName(m.op)});
+            try destText(a, b, m.dest, m.size);
+            try b.appendSlice(a, ", ");
+            try srcText(a, b, m.src, m.size);
+        },
+        .unary => |m| {
+            try b.print(a, "{s} ", .{unaryName(m.op)});
+            try destText(a, b, m.dest, m.size);
+        },
+        .incdec => |m| {
+            try b.appendSlice(a, if (m.op == .inc) "inc " else "dec ");
+            try destText(a, b, m.dest, m.size);
+        },
+        .shift => |m| {
+            try b.print(a, "{s} ", .{shiftName(m.op)});
+            try destText(a, b, m.dest, m.size);
+            try b.appendSlice(a, ", ");
+            switch (m.count) {
+                .imm => |n| try b.print(a, "{d}", .{n}),
+                .cl => try b.appendSlice(a, "cl"),
+            }
+        },
+        .imul => |m| {
+            try b.appendSlice(a, "imul ");
+            try b.appendSlice(a, regName(m.size, @backingInt(m.dest)));
+            try b.appendSlice(a, ", ");
+            switch (m.src) {
+                .reg => |r| try b.appendSlice(a, regName(m.size, @backingInt(r))),
+                .mem => |mem| try memText(a, b, mem, m.size),
+                .imm => |i| try immText(a, b, i),
+            }
+            if (m.imm) |i| {
+                try b.appendSlice(a, ", ");
+                try immText(a, b, i);
+            }
+        },
+
+        .jmp => |m| {
+            try b.appendSlice(a, "jmp ");
+            try targetText(a, b, m.target);
+        },
+        .jcc => |m| {
+            try b.print(a, "j{s} ", .{condName(m.cond)});
+            try b.print(a, ".{s}{d}", .{ relSign(m.rel), @abs(m.rel) });
+        },
+        .call => |m| {
+            try b.appendSlice(a, "call ");
+            try targetText(a, b, m.target);
+        },
+        .setcc => |m| {
+            try b.print(a, "set{s} ", .{condName(m.cond)});
+            try destText(a, b, m.dest, .byte);
+        },
+        .cmov => |m| {
+            try b.print(a, "cmov{s} ", .{condName(m.cond)});
+            try b.appendSlice(a, regName(m.size, @backingInt(m.dest)));
+            try b.appendSlice(a, ", ");
+            switch (m.src) {
+                .reg => |r| try b.appendSlice(a, regName(m.size, @backingInt(r))),
+                .mem => |mem| try memText(a, b, mem, m.size),
+                .imm => |i| try immText(a, b, i),
+            }
+        },
+
+        .io_in => |m| {
+            try b.appendSlice(a, "in ");
+            try b.appendSlice(a, regName(m.size, 0));
+            try b.appendSlice(a, ", ");
+            try portText(a, b, m.port);
+        },
+        .io_out => |m| {
+            try b.appendSlice(a, "out ");
+            try portText(a, b, m.port);
+            try b.appendSlice(a, ", ");
+            try b.appendSlice(a, regName(m.size, 0));
+        },
+
+        .movd => |m| {
+            try b.appendSlice(a, if (m.wide) "movq " else "movd ");
+            if (m.to_xmm) {
+                try b.print(a, "xmm{d}, ", .{@backingInt(m.xmm)});
+                try b.appendSlice(a, regNameWide(m.wide, @backingInt(m.gpr)));
+            } else {
+                try b.print(a, "{s}, ", .{regNameWide(m.wide, @backingInt(m.gpr))});
+                try b.print(a, "xmm{d}", .{@backingInt(m.xmm)});
+            }
+        },
+        .cvt_int_to_float => |m| {
+            try b.appendSlice(a, if (m.double) "cvtsi2sd " else "cvtsi2ss ");
+            try b.print(a, "xmm{d}, ", .{@backingInt(m.xmm)});
+            try b.appendSlice(a, regNameWide(m.wide, @backingInt(m.gpr)));
+        },
+        .cvt_float_to_int => |m| {
+            try b.appendSlice(a, if (m.double) "cvttsd2si " else "cvttss2si ");
+            try b.appendSlice(a, regNameWide(m.wide, @backingInt(m.gpr)));
+            try b.print(a, ", xmm{d}", .{@backingInt(m.xmm)});
+        },
+        .pinsrd => |m| {
+            try b.appendSlice(a, "pinsrd ");
+            try b.print(a, "xmm{d}, ", .{@backingInt(m.xmm)});
+            try b.appendSlice(a, regNameWide(m.wide, @backingInt(m.gpr)));
+            try b.print(a, ", {d}", .{m.imm});
+        },
+        .sse_shift_imm => |m| {
+            try b.print(a, "{s} xmm{d}, {d}", .{ decoder.sseShiftName(m.digit), @backingInt(m.xmm), m.imm });
+        },
+        .vinsertf128 => |m| {
+            try b.print(a, "vinsertf128 ymm{d}, ymm{d}, xmm{d}, {d}", .{
+                @backingInt(m.dst),
+                @backingInt(m.src1),
+                @backingInt(m.src2),
+                m.imm,
+            });
+        },
+        .vextractf128 => |m| {
+            try b.print(a, "vextractf128 xmm{d}, ymm{d}, {d}", .{ @backingInt(m.dst), @backingInt(m.src), m.imm });
+        },
+
+        .sse => |m| {
+            try b.print(a, "{s} ", .{sseMnemonic(m)});
+            if (m.store) {
+                try sseRmText(a, b, m.rm, m.hint);
+                try b.appendSlice(a, ", ");
+                try b.print(a, "xmm{d}", .{@backingInt(m.reg)});
+            } else {
+                try b.print(a, "xmm{d}, ", .{@backingInt(m.reg)});
+                try sseRmText(a, b, m.rm, m.hint);
+            }
+            if (m.imm) |imm| try b.print(a, ", {d}", .{imm});
+        },
+        .vex => |m| {
+            try b.print(a, "{s} ", .{decoder.vexName(m.op)});
+            if (m.store) {
+                try vexRmText(a, b, m.src2);
+                try b.appendSlice(a, ", ");
+                try b.print(a, "ymm{d}", .{@backingInt(m.dst)});
+            } else {
+                try b.print(a, "ymm{d}", .{@backingInt(m.dst)});
+                // The three-operand forms carry their first source in vvvv; the two-operand
+                // vmovups does not.
+                if (m.op != 0x10 and m.op != 0x11) {
+                    try b.appendSlice(a, ", ");
+                    try b.print(a, "ymm{d}", .{@backingInt(m.src1.?)});
+                }
+                try b.appendSlice(a, ", ");
+                try vexRmText(a, b, m.src2);
+            }
+        },
+
+        .unknown => |u| {
+            try b.appendSlice(a, ".byte 0x");
+            for (u.bytes[0..u.len]) |byte| try b.print(a, "{x:0>2}", .{byte});
+        },
+    }
+}
+
+fn sseMnemonic(m: decoder.Sse) []const u8 {
+    return switch (m.esc) {
+        0x3A => switch (m.op) {
+            0x21 => "insertps",
+            0x11 => if (m.mand == 0xF2) "roundsd" else "roundss",
+            else => "sse?",
+        },
+        else => decoder.sseName(m.mand, m.op) orelse "sse?",
+    };
+}
+
+fn sseRmText(a: std.mem.Allocator, b: *std.ArrayList(u8), rm: decoder.XmmOrMem, hint: ?Size) !void {
+    switch (rm) {
+        .xmm => |x| try b.print(a, "xmm{d}", .{@backingInt(x)}),
+        .mem => |m| try memText(a, b, m, hint),
+    }
+}
+
+fn vexRmText(a: std.mem.Allocator, b: *std.ArrayList(u8), rm: decoder.XmmOrMem) !void {
+    switch (rm) {
+        .xmm => |x| try b.print(a, "ymm{d}", .{@backingInt(x)}),
+        .mem => |m| try memText(a, b, m, null),
+    }
+}
+
+fn portText(a: std.mem.Allocator, b: *std.ArrayList(u8), port: decoder.Port) !void {
+    switch (port) {
+        .dx => try b.appendSlice(a, "dx"),
+        .imm => |n| try b.print(a, "{d}", .{n}),
+    }
+}
+
+/// Decode one instruction; append its text and return its byte length.
+fn decode(a: std.mem.Allocator, b: *std.ArrayList(u8), code: []const u8, pos: usize) !usize {
+    const d = decoder.decode(code, pos);
+    try render(a, b, d.inst);
+    return d.len;
 }
 
 fn expectOne(inst: encode.Inst, expected: []const u8) !void {
