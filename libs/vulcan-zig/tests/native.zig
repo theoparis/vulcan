@@ -656,6 +656,31 @@ test "sentinel-terminated slices and pointers [:0]const u8" {
     try std.testing.expectEqual(@as(usize, 5), r.f());
 }
 
+test "inferred error unions (!T) and try expression" {
+    const a = std.testing.allocator;
+    var mod = try zigc.compile(a,
+        \\fn divide(a: u64, b: u64) !u64 {
+        \\    if (b == 0) return error.DivisionByZero;
+        \\    return a / b;
+        \\}
+        \\fn compute(x: u64, y: u64) !u64 {
+        \\    const res = try divide(x, y);
+        \\    return res + 10;
+        \\}
+        \\fn runSafe(x: u64, y: u64) u64 {
+        \\    const val = compute(x, y) catch 999;
+        \\    return val;
+        \\}
+    );
+    defer mod.deinit(a);
+    var r = try jitFn(a, &mod, "runSafe", *const fn (u64, u64) callconv(.c) u64);
+    defer r.j.deinit();
+    // 50 / 2 + 10 = 35
+    try std.testing.expectEqual(@as(u64, 35), r.f(50, 2));
+    // divide by 0 catches and returns 999
+    try std.testing.expectEqual(@as(u64, 999), r.f(50, 0));
+}
+
 test "import declarations: unused namespaces do not enter generated IR" {
     const a = std.testing.allocator;
     var mod = try zigc.compile(a,
@@ -785,8 +810,6 @@ test "error: unsupported type (comptime generic parameter)" {
     const a = std.testing.allocator;
     try std.testing.expectError(error.UnsupportedType, zigc.compile(a, "fn f(comptime T: type) T { return undefined; }"));
 }
-
-
 
 test "globals: direct data, read-only data, and zero-initialized storage persist across calls" {
     const a = std.testing.allocator;

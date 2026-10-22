@@ -516,6 +516,20 @@ const Ctx = struct {
     literal_data: std.ArrayList(Data) = .empty,
     next_literal_id: u64 = 0,
     foreign_resolving: std.AutoHashMapUnmanaged(ForeignKey, void) = .empty,
+    inferred_error_names: std.ArrayList([]const u8) = .empty,
+
+    fn addInferredError(self: *Ctx, name: []const u8) Error!void {
+        for (self.inferred_error_names.items) |existing| {
+            if (std.mem.eql(u8, existing, name)) return;
+        }
+        try self.inferred_error_names.append(self.arena, name);
+    }
+
+    fn defaultErrorSet(self: *Ctx) Error!*const ZErrorSet {
+        const result = try self.arena.create(ZErrorSet);
+        result.* = .{ .names = self.inferred_error_names.items };
+        return result;
+    }
 
     fn resolve(self: *Ctx, name: []const u8) Error!*const StructDef {
         if (self.defs.get(name)) |d| return d;
@@ -758,6 +772,14 @@ fn resolveTypeIn(ctx: *Ctx, tree: *const Ast, dir: []const u8, node: Ast.Node.In
             payload.* = try resolveTypeIn(ctx, tree, dir, payload_node);
             return ZType{ .error_union = .{ .payload = payload, .errors = errors } };
         },
+        .bool_not => {
+            // In type context, !T is an inferred error union `!T`
+            const child_node = tree.nodeData(node).node;
+            if (isVoidType(tree, child_node)) return .error_void;
+            const payload = try ctx.arena.create(ZType);
+            payload.* = try resolveTypeIn(ctx, tree, dir, child_node);
+            return ZType{ .error_union = .{ .payload = payload, .errors = try ctx.defaultErrorSet() } };
+        },
 
         .optional_type => {
             const payload = try resolveTypeIn(ctx, tree, dir, tree.nodeData(node).node);
@@ -820,6 +842,20 @@ fn resolveErrorSetIn(ctx: *Ctx, tree: *const Ast, dir: []const u8, node: Ast.Nod
     const result = try ctx.arena.create(ZErrorSet);
     result.* = .{ .names = try names.toOwnedSlice(ctx.arena) };
     return result;
+}
+
+fn resolveFnReturnType(ctx: *Ctx, tree: *const Ast, dir: []const u8, ret_node: Ast.Node.Index) Error!?ZType {
+    if (isNoReturnType(tree, ret_node)) return null;
+    const first = tree.firstToken(ret_node);
+    const has_bang = first > 0 and tree.tokenTag(first - 1) == .bang;
+    if (has_bang) {
+        if (isVoidType(tree, ret_node)) return .error_void;
+        const payload = try ctx.arena.create(ZType);
+        payload.* = try resolveTypeIn(ctx, tree, dir, ret_node);
+        return ZType{ .error_union = .{ .payload = payload, .errors = try ctx.defaultErrorSet() } };
+    }
+    if (isVoidType(tree, ret_node)) return null;
+    return try resolveTypeIn(ctx, tree, dir, ret_node);
 }
 
 fn isVoidType(tree: *const Ast, node: Ast.Node.Index) bool {
@@ -1426,10 +1462,7 @@ fn importedFnSig(l: *L, fn_expr: Ast.Node.Index) Error!?FnSig {
         if (!std.mem.eql(u8, resolved.tree.tokenSlice(name_token), name)) continue;
         const ret_node = proto.ast.return_type.unwrap() orelse return Error.UnsupportedType;
         const is_noreturn = isNoReturnType(resolved.tree, ret_node);
-        const ret: ?ZType = if (is_noreturn or isVoidType(resolved.tree, ret_node))
-            null
-        else
-            try resolveTypeIn(l.r, resolved.tree, resolved.dir, ret_node);
+        const ret: ?ZType = try resolveFnReturnType(l.r, resolved.tree, resolved.dir, ret_node);
         var params: std.ArrayList(ZType) = .empty;
         var iter = proto.iterate(resolved.tree);
         while (iter.next()) |param| {
@@ -1479,10 +1512,7 @@ fn foreignMethodSig(l: *L, receiver: ZType, method_name: []const u8) Error!?FnSi
         if (!std.mem.eql(u8, key.tree.tokenSlice(name_token), method_name)) continue;
         const ret_node = proto.ast.return_type.unwrap() orelse return Error.UnsupportedType;
         const is_noreturn = isNoReturnType(key.tree, ret_node);
-        const ret: ?ZType = if (is_noreturn or isVoidType(key.tree, ret_node))
-            null
-        else
-            try resolveTypeIn(l.r, key.tree, dir, ret_node);
+        const ret: ?ZType = try resolveFnReturnType(l.r, key.tree, dir, ret_node);
         var params: std.ArrayList(ZType) = .empty;
         var iter = proto.iterate(key.tree);
         while (iter.next()) |param| {
@@ -2471,10 +2501,16 @@ fn lowerCall(l: *L, node: Ast.Node.Index) Error!?TypedValue {
         return TypedValue{ .value = slot, .zty = rz };
     };
     if (sig.ret) |rz| if (rz == .error_union) {
-        if (l.r.target != .aarch64 or rz.byteSize() <= 16) return Error.UnsupportedType;
         const slot = try optionalSlot(l, rz);
-        try args.insert(l.r.arena, 0, slot);
-        try l.func.appendCallSret(l.block, fname, args.items);
+        if (rz.byteSize() > 16) {
+            if (l.r.target != .aarch64) return Error.UnsupportedType;
+            try args.insert(l.r.arena, 0, slot);
+            try l.func.appendCallSret(l.block, fname, args.items);
+        } else {
+            try l.func.appendCallStructRet(l.block, fname, args.items, slot, &.{
+                .{ .offset = 0 }, .{ .offset = 8 },
+            });
+        }
         return TypedValue{ .value = slot, .zty = rz };
     };
     if (sig.ret) |rz| {
@@ -2519,6 +2555,87 @@ fn lowerAggregateCatch(l: *L, node: Ast.Node.Index, expected: ?ZType) Error!Type
     l.block = success;
     const value = try packOptional(l, optional_type, .{ .value = result.value, .zty = payload_type });
     return .{ .value = value.value, .zty = optional_type };
+}
+
+fn lowerCatchExpr(l: *L, node: Ast.Node.Index, expected: ?ZType) Error!TypedValue {
+    const tree = l.r.tree;
+    const d = tree.nodeData(node).node_and_node;
+    if (expected) |exp| {
+        if (exp == .optional_value) {
+            return lowerAggregateCatch(l, node, expected);
+        }
+    }
+    const result = try lowerExpr(l, d[0], null);
+    if (result.zty != .error_union) return Error.UnsupportedType;
+    const payload_type = result.zty.error_union.payload.*;
+
+    const tag_zty = ZType{ .error_void = {} };
+    const tag = try l.func.appendInst(l.block, try tag_zty.irType(l.func), .{ .load = .{
+        .ptr = try byteOffsetPtr(l, result.value, result.zty.errorTagOffset()),
+    } });
+    const zero = try l.func.appendInst(l.block, try tag_zty.irType(l.func), .{ .iconst = 0 });
+    const failed = try l.func.appendInst(l.block, try boolType(l.func), .{ .icmp = .{ .op = .ne, .lhs = tag, .rhs = zero } });
+    const handler = try l.func.appendBlock();
+    const success = try l.func.appendBlock();
+    try l.func.appendIf(l.block, failed, .{ .target = handler }, .{ .target = success });
+
+    if (payload_type.isAggregate()) {
+        const slot = try optionalSlot(l, payload_type);
+        const merge = try l.func.appendBlock();
+
+        l.block = success;
+        try copyAggregateBytes(l, slot, result.value, payload_type.byteSize());
+        try l.func.setJump(l.block, merge, &.{});
+
+        l.block = handler;
+        const env_len = l.env.items.len;
+        const catch_token = tree.nodeMainToken(node);
+        if (tree.tokenTag(catch_token + 1) == .pipe) {
+            const name_token = catch_token + 2;
+            if (tree.tokenTag(name_token) != .identifier) return Error.UnsupportedNode;
+            _ = try declareLocal(l, tree.tokenSlice(name_token), .{ .error_set = result.zty.error_union.errors }, tag);
+        }
+        if (tree.nodeTag(d[1]) == .@"return") {
+            _ = try lowerStmt(l, d[1]);
+        } else {
+            const fallback = try lowerExpr(l, d[1], payload_type);
+            if (!fallback.zty.eql(payload_type)) return Error.TypeMismatch;
+            try copyAggregateBytes(l, slot, fallback.value, payload_type.byteSize());
+            try l.func.setJump(l.block, merge, &.{});
+        }
+        l.env.items.len = env_len;
+
+        l.block = merge;
+        return .{ .value = slot, .zty = payload_type };
+    }
+
+    const res_irty = try payload_type.irType(l.func);
+    const merge = try l.func.appendBlock();
+    const phi = try l.func.appendBlockParam(merge, res_irty);
+
+    l.block = success;
+    const ok_val = try l.func.appendInst(l.block, res_irty, .{ .load = .{ .ptr = result.value } });
+    try l.func.setJump(l.block, merge, &.{ok_val});
+
+    l.block = handler;
+    const env_len = l.env.items.len;
+    const catch_token = tree.nodeMainToken(node);
+    if (tree.tokenTag(catch_token + 1) == .pipe) {
+        const name_token = catch_token + 2;
+        if (tree.tokenTag(name_token) != .identifier) return Error.UnsupportedNode;
+        _ = try declareLocal(l, tree.tokenSlice(name_token), .{ .error_set = result.zty.error_union.errors }, tag);
+    }
+    if (tree.nodeTag(d[1]) == .@"return") {
+        _ = try lowerStmt(l, d[1]);
+    } else {
+        const fallback = try lowerExpr(l, d[1], payload_type);
+        const conv = try convertTo(l, fallback, payload_type);
+        try l.func.setJump(l.block, merge, &.{conv.value});
+    }
+    l.env.items.len = env_len;
+
+    l.block = merge;
+    return .{ .value = phi, .zty = payload_type };
 }
 
 fn lowerVoidCatch(l: *L, node: Ast.Node.Index) Error!bool {
@@ -2764,6 +2881,85 @@ fn copyAggregateBytes(l: *L, dest: Value, source: Value, size: u64) Error!void {
         try l.func.appendStore(l.block, byte, try byteOffsetPtr(l, dest, offset));
     }
 }
+fn emitReturnErrorUnion(l: *L, ret_zty: ZType, tag: Value) Error!void {
+    if (ret_zty == .error_void) {
+        l.func.setTerminator(l.block, .{ .ret = ir.function.Ret.one(tag) });
+        return;
+    }
+    if (ret_zty != .error_union) return Error.TypeMismatch;
+    if (l.sret_ptr) |dest| {
+        const byte_ty = try l.func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+        const zero_byte = try l.func.appendInst(l.block, byte_ty, .{ .iconst = 0 });
+        var offset: u64 = 0;
+        while (offset < ret_zty.byteSize()) : (offset += 1)
+            try l.func.appendStore(l.block, zero_byte, try byteOffsetPtr(l, dest, offset));
+        try l.func.appendStore(l.block, tag, try byteOffsetPtr(l, dest, ret_zty.errorTagOffset()));
+        l.func.setTerminator(l.block, .{ .ret = ir.function.Ret.one(dest) });
+    } else {
+        const slot = try optionalSlot(l, ret_zty);
+        const byte_ty = try l.func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+        const zero_byte = try l.func.appendInst(l.block, byte_ty, .{ .iconst = 0 });
+        var offset: u64 = 0;
+        while (offset < ret_zty.byteSize()) : (offset += 1)
+            try l.func.appendStore(l.block, zero_byte, try byteOffsetPtr(l, slot, offset));
+        try l.func.appendStore(l.block, tag, try byteOffsetPtr(l, slot, ret_zty.errorTagOffset()));
+        var chunks: [2]Value = undefined;
+        const words = try optionalChunks(l, ret_zty, slot, &chunks);
+        l.func.setTerminator(l.block, .{ .ret = ir.function.Ret.many(words) });
+    }
+}
+
+fn lowerTryExpr(l: *L, node: Ast.Node.Index, expected: ?ZType) Error!TypedValue {
+    const tree = l.r.tree;
+    const child_node = tree.nodeData(node).node;
+    const ret_zty = l.ret_zty orelse return Error.TypeMismatch;
+    const result = try lowerExpr(l, child_node, null);
+
+    if (result.zty == .error_void) {
+        const zero = try l.func.appendInst(l.block, try result.zty.irType(l.func), .{ .iconst = 0 });
+        const failed = try l.func.appendInst(l.block, try boolType(l.func), .{ .icmp = .{ .op = .ne, .lhs = result.value, .rhs = zero } });
+        const ret_block = try l.func.appendBlock();
+        const next_block = try l.func.appendBlock();
+        try l.func.appendIf(l.block, failed, .{ .target = ret_block }, .{ .target = next_block });
+
+        l.block = ret_block;
+        try emitDeferredVaEnds(l);
+        try emitReturnErrorUnion(l, ret_zty, result.value);
+
+        l.block = next_block;
+        return result;
+    }
+
+    if (result.zty != .error_union) return Error.TypeMismatch;
+    const payload_type = result.zty.error_union.payload.*;
+
+    const tag_zty = ZType{ .error_void = {} };
+    const tag = try l.func.appendInst(l.block, try tag_zty.irType(l.func), .{ .load = .{
+        .ptr = try byteOffsetPtr(l, result.value, result.zty.errorTagOffset()),
+    } });
+    const zero = try l.func.appendInst(l.block, try tag_zty.irType(l.func), .{ .iconst = 0 });
+    const failed = try l.func.appendInst(l.block, try boolType(l.func), .{ .icmp = .{ .op = .ne, .lhs = tag, .rhs = zero } });
+    const ret_block = try l.func.appendBlock();
+    const next_block = try l.func.appendBlock();
+    try l.func.appendIf(l.block, failed, .{ .target = ret_block }, .{ .target = next_block });
+
+    l.block = ret_block;
+    try emitDeferredVaEnds(l);
+    try emitReturnErrorUnion(l, ret_zty, tag);
+
+    l.block = next_block;
+    if (payload_type.isAggregate()) {
+        const slot = try optionalSlot(l, payload_type);
+        try copyAggregateBytes(l, slot, result.value, payload_type.byteSize());
+        return .{ .value = slot, .zty = payload_type };
+    }
+    const val_irty = try payload_type.irType(l.func);
+    const val = try l.func.appendInst(l.block, val_irty, .{ .load = .{ .ptr = result.value } });
+    const tv = TypedValue{ .value = val, .zty = payload_type };
+    if (expected) |exp| return convertTo(l, tv, exp);
+    return tv;
+}
+
 fn lowerOrelse(l: *L, node: Ast.Node.Index, expected: ?ZType) Error!TypedValue {
     const tree = l.r.tree;
     const d = tree.nodeData(node).node_and_node;
@@ -3035,7 +3231,11 @@ fn errorTagForName(errors: ZErrorSet, name: []const u8) ?u16 {
 
 fn lowerErrorValue(l: *L, node: Ast.Node.Index, expected: ?ZType) Error!TypedValue {
     const name = l.r.tree.tokenSlice(l.r.tree.nodeMainToken(node) + 2);
-    const zty = expected orelse return Error.TypeMismatch;
+    const zty = expected orelse blk: {
+        try l.r.addInferredError(name);
+        const err_set = try l.r.defaultErrorSet();
+        break :blk ZType{ .error_set = err_set };
+    };
     if (zty == .error_void) {
         const tag_type = try zty.irType(l.func);
         return .{ .value = try l.func.appendInst(l.block, tag_type, .{ .iconst = 1 }), .zty = zty };
@@ -3045,7 +3245,10 @@ fn lowerErrorValue(l: *L, node: Ast.Node.Index, expected: ?ZType) Error!TypedVal
         .error_union => |union_type| union_type.errors.*,
         else => return Error.TypeMismatch,
     };
-    const tag = errorTagForName(errors, name) orelse return Error.TypeMismatch;
+    const tag = errorTagForName(errors, name) orelse blk: {
+        try l.r.addInferredError(name);
+        break :blk errorTagForName(errors, name) orelse return Error.TypeMismatch;
+    };
     const error_type: ZType = .{ .error_set = switch (zty) {
         .error_set => |set| set,
         .error_union => |union_type| union_type.errors,
@@ -3091,7 +3294,8 @@ fn lowerExpr(l: *L, node: Ast.Node.Index, expected: ?ZType) Error!TypedValue {
     const tree = l.r.tree;
     if (try importedIntegerConstant(l, node, expected)) |constant| return constant;
     if (expected != null and tree.nodeTag(node) == .@"orelse") return lowerOrelse(l, node, expected);
-    if (expected != null and tree.nodeTag(node) == .@"catch") return lowerAggregateCatch(l, node, expected);
+    if (tree.nodeTag(node) == .@"catch") return lowerCatchExpr(l, node, expected);
+    if (tree.nodeTag(node) == .@"try") return lowerTryExpr(l, node, expected);
     if (expected) |zty| if (zty == .error_union) return lowerExpectedErrorUnion(l, node, zty);
     if (expected) |zty| if (zty == .optional_value) {
         if (tree.nodeTag(node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "null"))
@@ -3152,7 +3356,8 @@ fn lowerExpr(l: *L, node: Ast.Node.Index, expected: ?ZType) Error!TypedValue {
         .call_one, .call_one_comma, .call, .call_comma => return try lowerCall(l, node) orelse Error.TypeMismatch,
         .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return try lowerBuiltinCall(l, node, expected) orelse Error.TypeMismatch,
         .@"orelse" => return lowerOrelse(l, node, expected),
-        .@"catch" => return lowerAggregateCatch(l, node, expected),
+        .@"catch" => return lowerCatchExpr(l, node, expected),
+        .@"try" => return lowerTryExpr(l, node, expected),
         .add, .add_wrap, .sub, .sub_wrap, .mul, .mul_wrap, .div, .mod, .bit_and, .bit_or, .bit_xor, .shl, .shr => {
             const d = tree.nodeData(node).node_and_node;
             const lhs = try lowerExpr(l, d[0], expected);
@@ -3499,6 +3704,10 @@ fn lowerStmt(l: *L, stmt: Ast.Node.Index) Error!bool {
         },
 
         .@"catch" => return lowerVoidCatch(l, stmt),
+        .@"try" => {
+            _ = try lowerTryExpr(l, stmt, null);
+            return false;
+        },
         .@"defer" => {
             const deferred = tree.nodeData(stmt).node;
             if (!isBuiltinCallTag(tree.nodeTag(deferred)) or !std.mem.eql(u8, builtinName(tree, deferred), "@cVaEnd")) return Error.UnsupportedNode;
@@ -3705,9 +3914,14 @@ fn lowerStmt(l: *L, stmt: Ast.Node.Index) Error!bool {
                     l.func.setTerminator(l.block, .{ .ret = ir.function.Ret.many(words) });
                 }
             } else if (rz == .error_union) {
-                const dest = l.sret_ptr orelse return Error.UnsupportedType;
-                try copyAggregateBytes(l, dest, v.value, rz.byteSize());
-                l.func.setTerminator(l.block, .{ .ret = ir.function.Ret.one(dest) });
+                if (l.sret_ptr) |dest| {
+                    try copyAggregateBytes(l, dest, v.value, rz.byteSize());
+                    l.func.setTerminator(l.block, .{ .ret = ir.function.Ret.one(dest) });
+                } else {
+                    var chunks: [2]Value = undefined;
+                    const words = try optionalChunks(l, rz, v.value, &chunks);
+                    l.func.setTerminator(l.block, .{ .ret = ir.function.Ret.many(words) });
+                }
             } else {
                 const cv = try convertTo(l, v, rz);
                 l.func.setTerminator(l.block, .{ .ret = ir.function.Ret.one(cv.value) });
@@ -3888,17 +4102,13 @@ fn lowerFunction(gpa: std.mem.Allocator, ctx: *Ctx, proto_node: Ast.Node.Index, 
 
     const ret_node = fn_proto.ast.return_type.unwrap() orelse return Error.UnsupportedNode;
     const is_noreturn = isNoReturnType(tree, ret_node);
-    var ret_zty: ?ZType = null;
-    if (!isVoidType(tree, ret_node) and !is_noreturn) {
-        const rz = try resolveType(ctx, ret_node);
+    const ret_zty: ?ZType = try resolveFnReturnType(ctx, tree, ctx.dir, ret_node);
+    if (ret_zty) |rz| {
         if ((rz.isAggregate() and rz != .optional_value and rz != .slice and rz != .error_union) or (rz.optionalPayloadIsAggregate() and (ctx.target != .aarch64 or rz.byteSize() <= 16))) return Error.UnsupportedType;
-        ret_zty = rz;
-    }
-    if (ret_zty) |ret| {
-        if (ret == .error_union and (ctx.target != .aarch64 or ret.byteSize() <= 16)) return Error.UnsupportedType;
+        if (rz == .error_union and rz.byteSize() > 16 and ctx.target != .aarch64) return Error.UnsupportedType;
     }
 
-    const use_sret = if (ret_zty) |rz| rz == .error_union or (rz.optionalPayloadIsAggregate() and rz.byteSize() > 16) else false;
+    const use_sret = if (ret_zty) |rz| (rz == .error_union and rz.byteSize() > 16) or (rz.optionalPayloadIsAggregate() and rz.byteSize() > 16) else false;
     if (use_sret) func.sret = true;
     var l: L = .{ .r = ctx, .func = &func, .block = entry, .ret_zty = ret_zty, .env = .empty, .fn_sigs = fn_sigs, .is_naked = isNakedCallconv(tree, fn_proto) };
     if (use_sret) l.sret_ptr = try func.appendBlockParam(entry, try func.types.ptrGlobal());
@@ -4001,6 +4211,13 @@ fn lowerRoot(gpa: std.mem.Allocator, arena: std.mem.Allocator, tree: *const Ast,
         gpa.free(d.name);
         gpa.free(d.bytes);
     };
+
+    for (0..tree.nodes.len) |node_idx| {
+        if (tree.nodes.items(.tag)[node_idx] == .error_value) {
+            const err_name = tree.tokenSlice(tree.nodeMainToken(@fromBackingInt(@intCast(node_idx))) + 2);
+            try ctx.addInferredError(err_name);
+        }
+    }
 
     for (tree.rootDecls()) |decl| {
         switch (tree.nodeTag(decl)) {
@@ -4172,12 +4389,10 @@ fn lowerRoot(gpa: std.mem.Allocator, arena: std.mem.Allocator, tree: *const Ast,
         }
         const ret_node = fn_proto.ast.return_type.unwrap() orelse return Error.UnsupportedNode;
         const is_noreturn = isNoReturnType(tree, ret_node);
-        var ret: ?ZType = null;
-        if (!isVoidType(tree, ret_node) and !is_noreturn) {
-            const rz = try resolveType(&ctx, ret_node);
+        const ret: ?ZType = try resolveFnReturnType(&ctx, tree, ctx.dir, ret_node);
+        if (ret) |rz| {
             if ((rz.isAggregate() and rz != .optional_value and rz != .slice and rz != .error_union) or (rz.optionalPayloadIsAggregate() and (target != .aarch64 or rz.byteSize() <= 16))) return Error.UnsupportedType;
-            if (rz == .error_union and (target != .aarch64 or rz.byteSize() <= 16)) return Error.UnsupportedType;
-            ret = rz;
+            if (rz == .error_union and rz.byteSize() > 16 and target != .aarch64) return Error.UnsupportedType;
         }
         try fn_sigs.append(arena, .{
             .name = fd.name,
