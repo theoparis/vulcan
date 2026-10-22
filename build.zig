@@ -160,6 +160,25 @@ pub fn build(b: *std.Build) void {
     // same standard library this build uses.
     const zig_cli_opts = b.addOptions();
     zig_cli_opts.addOptionPathDirectory("zig_lib_dir", .zig_lib);
+    zig_cli_opts.addOption([]const u8, "zig_exe", b.graph.zig_exe);
+    zig_cli_opts.addOptionPathUntracked("global_cache_dir", b.graph.path(.global_cache, ""));
+    const zig_maker = b.addExecutable(.{
+        .name = "vulcan-zig-maker",
+        .root_module = b.createModule(.{
+            .root_source_file = std.Build.LazyPath.zig_lib.path(b, "compiler/Maker.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const install_zig_maker = b.addInstallArtifact(zig_maker, .{});
+    b.getInstallStep().dependOn(&install_zig_maker.step);
+    const zig_cli_options_module = zig_cli_opts.createModule();
+    const zig_build_module = b.createModule(.{
+        .root_source_file = b.path("frontends/vulcan-zig-build.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "build_options", .module = zig_cli_options_module }},
+    });
     const zig_cli = b.addExecutable(.{ .name = "vulcan-zig", .root_module = b.createModule(.{
         .root_source_file = b.path("frontends/vulcan-zig.zig"),
         .target = target,
@@ -168,10 +187,12 @@ pub fn build(b: *std.Build) void {
             .{ .name = "vulcan-zig", .module = vulcan_zig },
             .{ .name = "vulcan-target", .module = vulcan_target },
             .{ .name = "vulcan-link", .module = vulcan_link },
-            .{ .name = "build_options", .module = zig_cli_opts.createModule() },
+            .{ .name = "build_options", .module = zig_cli_options_module },
+            .{ .name = "vulcan-zig-build", .module = zig_build_module },
         },
     }) });
-    b.installArtifact(zig_cli);
+    const install_zig_cli = b.addInstallArtifact(zig_cli, .{});
+    b.getInstallStep().dependOn(&install_zig_cli.step);
 
     // The Vulcan C Compiler driver executable (clang-compatible CLI surface, SM1).
     // Hoisted into a `const` module (SM15 M5a) so both the exe and its in-file `parseArgs`
@@ -251,9 +272,11 @@ pub fn build(b: *std.Build) void {
             run_glsl_step.dependOn(&run_glsl.step);
 
             // The Zig frontend CLI runner (zig_cli is declared above).
-            const run_zig = b.addRunArtifact(zig_cli);
+            const run_zig = b.addRunFile(b.graph.path(.install_bin, "vulcan-zig"));
+            run_zig.step.dependOn(&install_zig_cli.step);
+            run_zig.step.dependOn(&install_zig_maker.step);
             run_zig.addPassthruArgs();
-            const run_zig_step = b.step("run-zig", "Run vulcan-zig build-exe or build-obj");
+            const run_zig_step = b.step("run-zig", "Run vulcan-zig build, build-exe, build-obj or test");
             run_zig_step.dependOn(&run_zig.step);
 
             // The GLSL -> target-disassembly debugging tool: compile a shader and print the
@@ -840,6 +863,22 @@ pub fn build(b: *std.Build) void {
     const run_zig_exec = b.addRunArtifact(zig_exec);
     zig_test_step.dependOn(&run_zig_exec.step);
     test_step.dependOn(&run_zig_exec.step);
+
+    const zig_build_test_opts = b.addOptions();
+    zig_build_test_opts.addOption([]const u8, "zig_exe", b.graph.zig_exe);
+    zig_build_test_opts.addOption([]const u8, "build_root", b.fmt("{f}", .{b.root}));
+    zig_build_test_opts.addOptionPath("vulcan_zig_exe", b.graph.path(.install_bin, "vulcan-zig"));
+    zig_build_test_opts.step.dependOn(&install_zig_cli.step);
+    zig_build_test_opts.step.dependOn(&install_zig_maker.step);
+    const zig_build_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-zig/tests/build.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "build_options", .module = zig_build_test_opts.createModule() }},
+    }) });
+    const run_zig_build_tests = b.addRunArtifact(zig_build_tests);
+    zig_test_step.dependOn(&run_zig_build_tests.step);
+    test_step.dependOn(&run_zig_build_tests.step);
 
     // Zig frontend differential oracle: the real `zig` compiler runs the same source (with a
     // synthesized `main` printing the call's result) and its stdout is compared against this
