@@ -339,6 +339,14 @@ test "optional integer calls preserve null, payload, and adjacent stack slots" {
 // ---------------------------------------------------------------------------------------
 
 const ZInt = struct { signed: bool, bits: u16 };
+/// The type of `std.builtin.Signedness` as this frontend models it: a two-tag enum.
+const signedness: ZType = .{ .enumeration = &signedness_def };
+const signedness_def: EnumDef = .{
+    .name = "Signedness",
+    .backing = .{ .signed = false, .bits = 1 },
+    .fields = &.{ .{ .name = "unsigned", .value = 0 }, .{ .name = "signed", .value = 1 } },
+    .non_exhaustive = false,
+};
 const ZErrorSet = struct { names: []const []const u8 };
 const ZErrorUnion = struct { payload: *const ZType, errors: *const ZErrorSet };
 
@@ -366,6 +374,9 @@ const ZType = union(enum) {
     strct: *const StructDef,
     /// Nominal: `ZType.enumeration` carries its identity, never just the backing width.
     enumeration: *const EnumDef,
+    /// The type of a comptime `type` value (`@TypeOf(std.builtin.Type)`-like). Only
+    /// exists while evaluating comptime metadata; never materialized at runtime.
+    type_value,
     /// A `@cVaStart()`-initialized `va_list` object. Backend-opaque: this frontend never reads
     /// or writes its bytes itself (`ir.function.Opcode.va_start`/`va_arg`/`va_end` do, at
     /// fixed per-target offsets (AAPCS64 needs 32 bytes), only needs a slot it can address,
@@ -390,7 +401,7 @@ const ZType = union(enum) {
     fn alignment(self: ZType) u64 {
         return switch (self) {
             .error_void => 2,
-            .boolean, .opaque_type => 1,
+            .boolean, .opaque_type, .type_value => 1,
             .int, .float => self.byteSize(),
             .enumeration => |e| enumByteSize(e.backing),
             .ptr, .optional_ptr, .slice, .va_list => 8,
@@ -410,6 +421,7 @@ const ZType = union(enum) {
             .boolean => 1,
             .int => |i| (@as(u64, i.bits) + 7) / 8,
             .enumeration => |e| enumByteSize(e.backing),
+            .type_value => 8,
             .opaque_type => 0,
             .float => |f| switch (f) {
                 .f16 => 2,
@@ -443,6 +455,7 @@ const ZType = union(enum) {
             .opaque_type => unreachable, // Zig never materializes an anyopaque value.
             .int => |i| func.types.intern(.{ .int = .{ .signedness = if (i.signed) .signed else .unsigned, .bits = i.bits } }),
             .enumeration => |e| func.types.intern(.{ .int = .{ .signedness = if (e.backing.signed) .signed else .unsigned, .bits = e.backing.bits } }),
+            .type_value => unreachable,
             .float => |f| func.types.intern(.{ .float = f }),
             .ptr, .optional_ptr => func.types.ptrGlobal(),
             .slice => blk: {
@@ -492,6 +505,7 @@ const ZType = union(enum) {
             .array => |aa| aa.len == b.array.len and aa.elem.eql(b.array.elem.*),
             .strct => |as_| as_ == b.strct,
             .enumeration => |ae| ae == b.enumeration,
+            .type_value => true,
             .error_set => |ae| errorSetsEqual(ae.*, b.error_set.*),
             .error_union => |ae| ae.payload.eql(b.error_union.payload.*) and errorSetsEqual(ae.errors.*, b.error_union.errors.*),
             .va_list => true,
@@ -539,17 +553,26 @@ const TypeDeclInfo = struct { decl_node: Ast.Node.Index, parent: ?Ast.Node.Index
 const DeclKey = struct { tree: *const Ast, node: Ast.Node.Index };
 const ConstValue = union(enum) {
     boolean: bool,
+    /// A comptime `type` (or `@typeInfo(T)`) carried through the evaluator.
+    type_value: ZType,
     /// The integer's bit pattern; its width and signedness come from the expression that
     /// produced it (`EvalValue.zty`), because Zig integers are typed rather than `i64`.
     int: i64,
 };
 /// A comptime value with the type it was evaluated at.
-const EvalValue = struct { zty: ZType, value: ConstValue };
 /// Evaluation answer plus whether the expression depended on a runtime value (an enum
 /// literal without an expected type, or a non-comptime parameter). A dependent result may
 /// be used for its type, but never folded into data or a constant.
 const Eval = struct { value: EvalValue, dependent: bool = false };
-const ConstBinding = struct { name: []const u8, value: i64 };
+/// A comptime value: its type, its integer or enum bit pattern, and — for values that
+/// are not plain integers — the `type` it stands for.
+const EvalValue = struct {
+    zty: ZType,
+    value: ConstValue,
+    /// Set when this value is a comptime `type` or a `@typeInfo(T)` record.
+    subject: ?ZType = null,
+};
+const ConstBinding = struct { name: []const u8, value: ConstValue };
 
 fn errorSetsEqual(a: ZErrorSet, b: ZErrorSet) bool {
     if (a.names.len != b.names.len) return false;
@@ -1407,6 +1430,7 @@ fn encodeConstValue(allocator: std.mem.Allocator, zty: ZType, value: ConstValue)
             if (zty != .boolean) return Error.TypeMismatch;
             bytes[0] = @intFromBool(boolean);
         },
+        .type_value => return Error.UnsupportedType,
         .int => |integer| {
             if (zty != .int) return Error.TypeMismatch;
             var bits: u64 = @bitCast(integer);
@@ -1718,6 +1742,7 @@ fn constEntryValue(l: *L, entry: ConstEntry, expected: ?ZType) Error!TypedValue 
         if (zty != .int and zty != .boolean) return Error.TypeMismatch;
     }
     switch (entry.value) {
+        .type_value => return Error.UnsupportedType,
         .boolean => |value| return .{ .value = try l.func.appendInst(l.block, try boolType(l.func), .{ .iconst = @intFromBool(value) }), .zty = .boolean },
         .int => |value| {
             const zty = expected orelse entry.zty;
@@ -1770,8 +1795,28 @@ fn evalTypedInt(ctx: *Ctx, tree: *const Ast, node: Ast.Node.Index, bindings: []c
     return evalInt(ctx, tree, node, bindings, depth, null);
 }
 
-/// Evaluate a typed comptime integer expression. `expected` supplies the type of an
-/// untyped literal or enum literal; without one a number keeps its literal value and the
+/// Evaluate a comptime `type` expression, which is either a named type or `@typeInfo(T)`.
+fn evalTypeValue(ctx: *Ctx, tree: *const Ast, node: Ast.Node.Index, bindings: []const ConstBinding, depth: u8) ?ZType {
+    if (depth == 32) return null;
+    if (tree.nodeTag(node) == .identifier) {
+        const name = tree.tokenSlice(tree.nodeMainToken(node));
+        for (bindings) |binding| if (std.mem.eql(u8, binding.name, name)) switch (binding.value) {
+            .type_value => |zty| return zty,
+            else => {},
+        };
+    }
+    if (isBuiltinCallTag(tree.nodeTag(node)) and std.mem.eql(u8, builtinName(tree, node), "@TypeOf")) {
+        var buf: [2]Ast.Node.Index = undefined;
+        const args = builtinArgs(tree, node, &buf);
+        if (args.len != 1) return null;
+        const value = evalInt(ctx, tree, args[0], bindings, depth + 1, null) orelse return null;
+        return value.subject orelse value.zty;
+    }
+    return resolveTypeIn(ctx, tree, ownerDir(ctx, tree), node) catch null;
+}
+
+/// Evaluate a typed comptime expression. `expected` supplies the type of an untyped
+/// literal or enum literal; without one a number keeps its literal value and the
 /// evaluator cannot resolve enum fields. Results always carry a real type so `usize`
 /// limits and enum backings are never reinterpreted as `i64`.
 fn evalInt(
@@ -1796,7 +1841,14 @@ fn evalInt(
         .identifier => {
             const name = tree.tokenSlice(tree.nodeMainToken(node));
             for (bindings) |binding| {
-                if (std.mem.eql(u8, binding.name, name)) return .{ .zty = expected orelse ZType{ .int = .{ .signed = true, .bits = 64 } }, .value = .{ .int = binding.value } };
+                if (!std.mem.eql(u8, binding.name, name)) continue;
+                return switch (binding.value) {
+                    .type_value => |zty| .{ .zty = .type_value, .value = .{ .type_value = zty }, .subject = zty },
+                    else => blk: {
+                        const target = expected orelse ZType{ .int = .{ .signed = true, .bits = 64 } };
+                        break :blk .{ .zty = target, .value = binding.value };
+                    },
+                };
             }
             if (tree == ctx.tree) {
                 if (ctx.constants.get(name)) |value| {
@@ -1825,6 +1877,31 @@ fn evalInt(
         .field_access => {
             const access = tree.nodeData(node).node_and_token;
             const dir = ownerDir(ctx, tree);
+            // `<info>.int` where `<info>` holds a `@typeInfo(T)` record: the record's
+            // integer info. Its own fields are answered below.
+            if (tree.nodeTag(access[0]) == .identifier) {
+                const base_name = tree.tokenSlice(tree.nodeMainToken(access[0]));
+                for (bindings) |binding| {
+                    if (!std.mem.eql(u8, binding.name, base_name)) continue;
+                    switch (binding.value) {
+                        .type_value => |subject| {
+                            if (std.mem.eql(u8, tree.tokenSlice(access[1]), "int")) {
+                                return .{ .zty = .type_value, .value = .{ .type_value = subject }, .subject = subject };
+                            }
+                            const as_int = switch (subject) {
+                                .int => |i| ZType{ .int = i },
+                                .enumeration => |e| ZType{ .int = e.backing },
+                                else => return null,
+                            };
+                            const field = tree.tokenSlice(access[1]);
+                            if (std.mem.eql(u8, field, "bits")) return .{ .zty = .{ .int = .{ .signed = false, .bits = 16 } }, .value = .{ .int = as_int.int.bits } };
+                            if (std.mem.eql(u8, field, "signedness")) return .{ .zty = signedness, .value = .{ .int = if (as_int.int.signed) 1 else 0 } };
+                            return null;
+                        },
+                        else => return null,
+                    }
+                }
+            }
             const resolved = resolveQualifiedName(ctx, tree, dir, access[0]) catch return null;
             const field_name = tree.tokenSlice(access[1]);
             if (resolved.node) |container| {
@@ -1927,6 +2004,11 @@ fn evalInt(
                 if (source.zty != .int) return null;
                 return .{ .zty = target, .value = source.value };
             }
+            if (std.mem.eql(u8, name, "@typeInfo")) {
+                if (args.len != 1) return null;
+                const subject = evalTypeValue(ctx, tree, args[0], bindings, depth + 1) orelse return null;
+                return .{ .zty = .type_value, .value = .{ .type_value = subject }, .subject = subject };
+            }
             return null;
         },
         .call_one, .call_one_comma, .call, .call_comma => return evalIntCall(ctx, tree, node, bindings, depth, expected),
@@ -1948,46 +2030,77 @@ fn evalIntCall(
 ) ?EvalValue {
     var call_buf: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&call_buf, node) orelse return null;
+    // A qualified call (`std.math.maxInt`) reaches a function in another file; evaluate
+    // it in that file's context, where its declaration lives.
+    if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
+        const access = tree.nodeData(call.ast.fn_expr).node_and_token;
+        const resolved = resolveQualifiedName(ctx, tree, ownerDir(ctx, tree), access[0]) catch return null;
+        if (resolved.node != null) return null;
+        const target = ctx.compiler.contextFor(resolved.tree) catch return null;
+        const fn_name = tree.tokenSlice(access[1]);
+        for (resolved.tree.rootDecls()) |decl| {
+            if (resolved.tree.nodeTag(decl) != .fn_decl) continue;
+            const data = resolved.tree.nodeData(decl).node_and_node;
+            var proto_buf: [1]Ast.Node.Index = undefined;
+            const proto = resolved.tree.fullFnProto(&proto_buf, data[0]) orelse continue;
+            const name_token = proto.name_token orelse continue;
+            if (!std.mem.eql(u8, resolved.tree.tokenSlice(name_token), fn_name)) continue;
+            return evalCallBody(target, resolved.tree, proto, data[1], call, node, bindings, depth, expected);
+        }
+        return null;
+    }
     if (tree.nodeTag(call.ast.fn_expr) != .identifier) return null;
     const name = tree.tokenSlice(tree.nodeMainToken(call.ast.fn_expr));
-    var proto_node: ?Ast.Node.Index = null;
-    var body_node: ?Ast.Node.Index = null;
     for (tree.rootDecls()) |decl| {
         if (tree.nodeTag(decl) != .fn_decl) continue;
         const data = tree.nodeData(decl).node_and_node;
         var proto_buf: [1]Ast.Node.Index = undefined;
         const proto = tree.fullFnProto(&proto_buf, data[0]) orelse continue;
         const name_token = proto.name_token orelse continue;
-        if (std.mem.eql(u8, tree.tokenSlice(name_token), name)) {
-            proto_node = data[0];
-            body_node = data[1];
-            break;
-        }
+        if (!std.mem.eql(u8, tree.tokenSlice(name_token), name)) continue;
+        // Arguments are written in the caller's file; the body in the declaration's.
+        return evalCallBody(ctx, tree, proto, data[1], call, node, bindings, depth, expected);
     }
-    const proto = tree.fullFnProto(&call_buf, proto_node orelse return null) orelse return null;
-    const body = body_node orelse return null;
+    return null;
+}
+
+/// Evaluate one function body for a call whose arguments were written in `arg_tree`.
+fn evalCallBody(
+    ctx: *Ctx,
+    tree: *const Ast,
+    proto: Ast.full.FnProto,
+    body: Ast.Node.Index,
+    call: Ast.full.Call,
+    call_node: Ast.Node.Index,
+    arg_bindings: []const ConstBinding,
+    depth: u8,
+    expected: ?ZType,
+) ?EvalValue {
+    _ = call_node;
     var local_bindings: [8]ConstBinding = undefined;
     var binding_count: usize = 0;
     var param_index: usize = 0;
     var params = proto.iterate(tree);
     while (params.next()) |param| {
         const name_token = param.name_token orelse return null;
-        // A `comptime T: type` parameter is bound from the argument's type, not value.
+        if (param_index >= call.ast.params.len) return null;
+        const arg = call.ast.params[param_index];
+        // `comptime T: type` binds the argument's type; anything else binds a value.
         if (param.comptime_noalias) |token| {
             if (tree.tokenTag(token) == .keyword_comptime) {
-                if (param_index >= call.ast.params.len) return null;
-                const zty = resolveTypeIn(ctx, tree, ownerDir(ctx, tree), call.ast.params[param_index]) catch return null;
-                if (zty != .int or zty.int.bits == 0) return null;
-                local_bindings[binding_count] = .{ .name = tree.tokenSlice(name_token), .value = @intCast(zty.int.bits) };
+                const subject = (evalTypeValue(ctx, tree, arg, arg_bindings, depth + 1) orelse
+                    evalTypeValue(ctx, tree, arg, &.{}, depth + 1)) orelse return null;
+                local_bindings[binding_count] = .{ .name = tree.tokenSlice(name_token), .value = .{ .type_value = subject } };
                 binding_count += 1;
                 param_index += 1;
                 continue;
             }
         }
-        if (param_index >= call.ast.params.len or binding_count >= local_bindings.len) return null;
         const param_type = resolveTypeIn(ctx, tree, ownerDir(ctx, tree), param.type_expr orelse return null) catch return null;
-        const value = evalInt(ctx, tree, call.ast.params[param_index], bindings, depth + 1, if (param_type == .int) param_type else null) orelse return null;
-        local_bindings[binding_count] = .{ .name = tree.tokenSlice(name_token), .value = value.value.int };
+        const value = (evalInt(ctx, tree, arg, arg_bindings, depth + 1, if (param_type == .int) param_type else null) orelse
+            evalInt(ctx, tree, arg, &.{}, depth + 1, if (param_type == .int) param_type else null)) orelse return null;
+        if (binding_count == local_bindings.len) return null;
+        local_bindings[binding_count] = .{ .name = tree.tokenSlice(name_token), .value = .{ .int = value.value.int } };
         binding_count += 1;
         param_index += 1;
     }
@@ -2007,7 +2120,7 @@ fn evalIntCall(
                 const init_node = vd.ast.init_node.unwrap() orelse return null;
                 const value = evalInt(ctx, tree, init_node, local_bindings[0..binding_count], depth + 1, declared) orelse return null;
                 if (binding_count == local_bindings.len) return null;
-                local_bindings[binding_count] = .{ .name = var_name, .value = value.value.int };
+                local_bindings[binding_count] = .{ .name = var_name, .value = value.value };
                 binding_count += 1;
             },
             .@"return" => {
@@ -2091,7 +2204,7 @@ fn evalArrayLength(ctx: *Ctx, tree: *const Ast, node: Ast.Node.Index, depth: u8)
             if (tree == ctx.tree) {
                 if (ctx.constants.get(name)) |value| switch (value.value) {
                     .int => |integer| return if (integer >= 0) @intCast(integer) else null,
-                    .boolean => {},
+                    .boolean, .type_value => {},
                 };
             }
             for (tree.rootDecls()) |decl| {
@@ -4199,6 +4312,8 @@ fn lowerExpr(l: *L, node: Ast.Node.Index, expected: ?ZType) Error!TypedValue {
     if (tree.nodeTag(node) == .@"catch") return lowerCatchExpr(l, node, expected);
     if (tree.nodeTag(node) == .@"try") return lowerTryExpr(l, node, expected);
     if (expected) |zty| if (zty == .error_union) return lowerExpectedErrorUnion(l, node, zty);
+    // `@as(Signedness, .signed)` and similar: the literal is typed by the expectation.
+    if (tree.nodeTag(node) == .enum_literal) return lowerEnumLiteral(l, node, expected);
     if (expected) |zty| if (zty == .optional_value) {
         if (tree.nodeTag(node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "null"))
             return packOptional(l, zty, null);
