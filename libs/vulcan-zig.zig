@@ -17,10 +17,13 @@ pub const compileForTarget = lower.compileForTarget;
 pub const compileFile = lower.compileFile;
 pub const compileFileOptions = lower.compileFileOptions;
 pub const FileCompileOptions = lower.FileCompileOptions;
+pub const Diagnostic = lower.Diagnostic;
 pub const ModuleMapping = lower.ModuleMapping;
+pub const ModuleDependency = lower.ModuleDependency;
 /// Architectures recognized by source-level target builtin folding.
 pub const TargetArch = lower.TargetArch;
 pub const Module = lower.Module;
+pub const Test = lower.Test;
 pub const NamedFunction = lower.NamedFunction;
 pub const Data = lower.Data;
 pub const DataKind = lower.DataKind;

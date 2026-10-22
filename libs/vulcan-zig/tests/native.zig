@@ -134,6 +134,179 @@ test "void error-union catch runs its handler only on errors" {
     try std.testing.expectEqual(@as(u64, 42), r.f());
 }
 
+test "module dependencies stay scoped through relative files and shared source paths" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "shared", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "shared/package.zig", .data =
+        \\pub const Packet = @import("detail.zig").Packet;
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "shared/detail.zig", .data =
+        \\const config = @import("config");
+        \\pub const Packet = extern struct {
+        \\    prefix: [config.count]u64,
+        \\    value: u64,
+        \\};
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "small.zig", .data = "pub const count = 1;" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "large.zig", .data = "pub const count = 3;" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "root.zig", .data =
+        \\const left = @import("left");
+        \\const right = @import("right");
+        \\const again = @import("left_again");
+        \\fn read_left(p: *left.Packet) u64 { return read_again(p); }
+        \\fn read_again(p: *again.Packet) u64 { return p.value; }
+        \\fn read_right(p: *right.Packet) u64 { return p.value; }
+    });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const paths = arena.allocator();
+    const root = try std.fs.path.join(paths, &.{ ".zig-cache", "tmp", &tmp.sub_path, "root.zig" });
+    const shared = try std.fs.path.join(paths, &.{ ".zig-cache", "tmp", &tmp.sub_path, "shared/package.zig" });
+    const small = try std.fs.path.join(paths, &.{ ".zig-cache", "tmp", &tmp.sub_path, "small.zig" });
+    const large = try std.fs.path.join(paths, &.{ ".zig-cache", "tmp", &tmp.sub_path, "large.zig" });
+    var mod = try zigc.compileFileOptions(a, io, root, .x86_64, .{
+        .root_module = "app",
+        .modules = &.{
+            .{ .name = "app", .path = root, .dependencies = &.{
+                .{ .name = "left", .module = "small_packet" },
+                .{ .name = "left_again", .module = "small_packet" },
+                .{ .name = "right", .module = "large_packet" },
+            } },
+            .{ .name = "small_packet", .path = shared, .dependencies = &.{.{ .name = "config", .module = "small" }} },
+            .{ .name = "large_packet", .path = shared, .dependencies = &.{.{ .name = "config", .module = "large" }} },
+            .{ .name = "small", .path = small },
+            .{ .name = "large", .path = large },
+        },
+    });
+    defer mod.deinit(a);
+    var left = try jitFn(a, &mod, "read_left", *const fn (*const [2]u64) callconv(.c) u64);
+    defer left.j.deinit();
+    var right = try jitFn(a, &mod, "read_right", *const fn (*const [4]u64) callconv(.c) u64);
+    defer right.j.deinit();
+    const short: [2]u64 = .{ 101, 11 };
+    const long: [4]u64 = .{ 103, 107, 109, 37 };
+    try std.testing.expectEqual(@as(u64, 11), left.f(&short));
+    try std.testing.expectEqual(@as(u64, 37), right.f(&long));
+}
+
+test "named modules are not visible without a dependency in the importing module" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "root.zig", .data =
+        \\const child = @import("child");
+        \\fn read(p: *child.Item) u64 { return p.value; }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "child.zig", .data =
+        \\pub const Item = @import("secret").Item;
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "secret", .data =
+        \\pub const Item = extern struct { value: u64 };
+    });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const paths = arena.allocator();
+    const root = try std.fs.path.join(paths, &.{ ".zig-cache", "tmp", &tmp.sub_path, "root.zig" });
+    const child = try std.fs.path.join(paths, &.{ ".zig-cache", "tmp", &tmp.sub_path, "child.zig" });
+    const secret = try std.fs.path.join(paths, &.{ ".zig-cache", "tmp", &tmp.sub_path, "secret" });
+    const modules: []const zigc.ModuleMapping = &.{
+        .{ .name = "app", .path = root, .dependencies = &.{
+            .{ .name = "child", .module = "child" },
+            .{ .name = "secret", .module = "secret" },
+        } },
+        .{ .name = "child", .path = child },
+        .{ .name = "secret", .path = secret },
+    };
+    try std.testing.expectError(zigc.Error.UnsupportedType, zigc.compileFileOptions(a, io, root, .x86_64, .{
+        .root_module = "app",
+        .modules = modules,
+    }));
+    try std.testing.expectError(zigc.Error.UnsupportedType, zigc.compileFileOptions(a, io, root, .x86_64, .{
+        .modules = modules,
+    }));
+    try tmp.dir.writeFile(io, .{ .sub_path = "std.zig", .data =
+        \\pub const Item = @import("secret").Item;
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "root.zig", .data =
+        \\const std = @import("std");
+        \\fn read(p: *std.Item) u64 { return p.value; }
+    });
+    const std_dir = std.fs.path.dirname(root) orelse return error.MissingDirectory;
+    try std.testing.expectError(zigc.Error.UnsupportedType, zigc.compileFileOptions(a, io, root, .x86_64, .{
+        .root_module = "app",
+        .modules = modules,
+        .std_dir = std_dir,
+    }));
+}
+
+test "dependency imports of root preserve the entry module type identity" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "child.zig", .data =
+        \\pub const Item = @import("root").Item;
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "root.zig", .data =
+        \\pub const Item = extern struct { value: u64 };
+        \\const child = @import("child_alias");
+        \\fn read(p: *child.Item) u64 { return read_root(p); }
+        \\fn read_root(p: *Item) u64 { return p.value; }
+    });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const paths = arena.allocator();
+    const root = try std.fs.path.join(paths, &.{ ".zig-cache", "tmp", &tmp.sub_path, "root.zig" });
+    const child = try std.fs.path.join(paths, &.{ ".zig-cache", "tmp", &tmp.sub_path, "child.zig" });
+    var mod = try zigc.compileFileOptions(a, io, root, .x86_64, .{
+        .root_module = "app",
+        .modules = &.{
+            .{ .name = "app", .path = root, .dependencies = &.{.{ .name = "child_alias", .module = "child" }} },
+            .{ .name = "child", .path = child },
+        },
+    });
+    defer mod.deinit(a);
+    var r = try jitFn(a, &mod, "read", *const fn (*const u64) callconv(.c) u64);
+    defer r.j.deinit();
+    const value: u64 = 42;
+    try std.testing.expectEqual(value, r.f(&value));
+}
+
+test "invalid module graphs reject ambiguous and missing dependencies before reading files" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const invalid: []const zigc.FileCompileOptions = &.{
+        .{ .root_module = "missing" },
+        .{ .root_module = "app", .modules = &.{.{ .name = "app", .path = "other-root.zig" }} },
+        .{ .modules = &.{
+            .{ .name = "same", .path = "one.zig" },
+            .{ .name = "same", .path = "two.zig" },
+        } },
+        .{ .modules = &.{.{ .name = "", .path = "one.zig" }} },
+        .{ .modules = &.{.{ .name = "empty", .path = "" }} },
+        .{ .modules = &.{.{ .name = "app", .path = "one.zig", .dependencies = &.{
+            .{ .name = "dep", .module = "absent" },
+        } }} },
+        .{ .modules = &.{.{ .name = "app", .path = "one.zig", .dependencies = &.{
+            .{ .name = "dep", .module = "app" },
+            .{ .name = "dep", .module = "app" },
+        } }} },
+        .{ .modules = &.{.{ .name = "app", .path = "one.zig", .dependencies = &.{
+            .{ .name = "", .module = "app" },
+        } }} },
+        .{ .modules = &.{.{ .name = "app", .path = "one.zig", .dependencies = &.{
+            .{ .name = "dep", .module = "" },
+        } }} },
+    };
+    for (invalid) |options| {
+        try std.testing.expectError(zigc.Error.InvalidModuleGraph, zigc.compileFileOptions(a, io, "not-read.zig", .x86_64, options));
+    }
+}
+
 test "plain imported struct fields work across source files" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -165,49 +338,264 @@ test "plain imported struct fields work across source files" {
     try std.testing.expectEqual(@as(u64, 42), r.f());
 }
 
-test "imported mutable scalar globals resolve to linked data" {
+test "imported runtime calls traverse relative files and leave unused declarations lazy" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "state.zig", .data = "pub var ready: bool = false;" });
+    try tmp.dir.createDir(io, "nested", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "nested/leaf.zig", .data =
+        \\fn privateTwice(value: u64) u64 { return value * 2; }
+        \\pub fn answer() u64 { return privateTwice(21); }
+        \\pub fn unusedGeneric(comptime T: type, value: T) T { return value; }
+        \\pub fn unusedUnsupported(p: *anyopaque) void { p.* = undefined; }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "middle.zig", .data =
+        \\const leaf = @import("nested/leaf.zig");
+        \\pub fn answer() u64 { return leaf.answer(); }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "root.zig", .data =
+        \\const middle = @import("middle.zig");
+        \\fn run() u64 { return middle.answer(); }
+    });
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path, "root.zig" });
+    defer a.free(path);
+    var mod = try zigc.compileFile(a, io, path, .x86_64, null);
+    defer mod.deinit(a);
+    var r = try jitFn(a, &mod, "run", *const fn () callconv(.c) u64);
+    defer r.j.deinit();
+    try std.testing.expectEqual(@as(u64, 42), r.f());
+}
+
+test "diamond imports and aliases share mutable imported state" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "state.zig", .data =
+        \\pub var count: u64 = 1;
+        \\pub fn increment() void { count += 1; }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "left.zig", .data =
+        \\const state = @import("state.zig");
+        \\pub fn increment() void { state.increment(); }
+    });
+    const absolute_state = try tmp.dir.realPathFileAlloc(io, "state.zig", a);
+    defer a.free(absolute_state);
+    const right_source = try std.fmt.allocPrint(a,
+        \\const state = @import("{f}");
+        \\pub fn read() u64 {{ return state.count; }}
+    , .{std.zig.fmtString(absolute_state)});
+    defer a.free(right_source);
+    try tmp.dir.writeFile(io, .{ .sub_path = "right.zig", .data = right_source });
     try tmp.dir.writeFile(io, .{ .sub_path = "root.zig", .data =
         \\const state = @import("state.zig");
-        \\fn check() u64 {
-        \\    if (state.ready) return 1;
-        \\    return 0;
+        \\const left = @import("left.zig");
+        \\const right = @import("right.zig");
+        \\fn exercise() u64 {
+        \\    state.count = 10;
+        \\    left.increment();
+        \\    return right.read();
         \\}
     });
     const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path, "root.zig" });
     defer a.free(path);
-    const state_path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path, "state.zig" });
-    defer a.free(state_path);
-    var root = try zigc.compileFile(a, io, path, .x86_64, null);
-    defer root.deinit(a);
-    var state = try zigc.compileFile(a, io, state_path, .x86_64, null);
-    defer state.deinit(a);
+    var mod = try zigc.compileFile(a, io, path, .x86_64, null);
+    defer mod.deinit(a);
+    var r = try jitFn(a, &mod, "exercise", *const fn () callconv(.c) u64);
+    defer r.j.deinit();
+    try std.testing.expectEqual(@as(u64, 11), r.f());
+}
 
-    const functions = try a.alloc(target.native.ModuleFunction, root.funcs.len);
-    defer a.free(functions);
-    for (root.funcs, 0..) |*nf, i| functions[i] = .{ .name = nf.name, .func = &nf.func };
-    const data = try a.alloc(target.native.ModuleData, state.data.len);
-    defer a.free(data);
-    for (state.data, 0..) |d, i| data[i] = .{
-        .name = d.name,
-        .bytes = d.bytes,
-        .kind = switch (d.kind) {
-            .rodata => .rodata,
-            .data => .data,
-            .bss => .bss,
+test "same-named imported runtime definitions remain independent" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "left.zig", .data =
+        \\var count: u64 = 2;
+        \\pub fn next() u64 { count += 1; return count; }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "right.zig", .data =
+        \\var count: u64 = 8;
+        \\pub fn next() u64 { count += 1; return count; }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "root.zig", .data =
+        \\const left = @import("left.zig");
+        \\const right = @import("right.zig");
+        \\fn exercise() u64 { return left.next() * 100 + right.next(); }
+    });
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path, "root.zig" });
+    defer a.free(path);
+    var mod = try zigc.compileFile(a, io, path, .x86_64, null);
+    defer mod.deinit(a);
+    var r = try jitFn(a, &mod, "exercise", *const fn () callconv(.c) u64);
+    defer r.j.deinit();
+    try std.testing.expectEqual(@as(u64, 309), r.f());
+    try std.testing.expectEqual(@as(u64, 410), r.f());
+}
+
+test "one source instantiated with separate dependencies keeps runtime state separate" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "shared.zig", .data =
+        \\const config = @import("config");
+        \\var count: u64 = config.initial;
+        \\pub fn next() u64 { count += 1; return count; }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "small.zig", .data = "pub const initial = 2;" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "large.zig", .data = "pub const initial = 8;" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "root.zig", .data =
+        \\const left = @import("left");
+        \\const right = @import("right");
+        \\const unused = @import("not_needed.zig");
+        \\fn exercise() u64 { return left.next() * 100 + right.next(); }
+    });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const paths = arena.allocator();
+    const root = try std.fs.path.join(paths, &.{ ".zig-cache", "tmp", &tmp.sub_path, "root.zig" });
+    const shared = try std.fs.path.join(paths, &.{ ".zig-cache", "tmp", &tmp.sub_path, "shared.zig" });
+    const small = try std.fs.path.join(paths, &.{ ".zig-cache", "tmp", &tmp.sub_path, "small.zig" });
+    const large = try std.fs.path.join(paths, &.{ ".zig-cache", "tmp", &tmp.sub_path, "large.zig" });
+    var mod = try zigc.compileFileOptions(a, io, root, .x86_64, .{
+        .root_module = "app",
+        .collect_source_files = true,
+        .modules = &.{
+            .{ .name = "app", .path = root, .dependencies = &.{
+                .{ .name = "left", .module = "small_instance" },
+                .{ .name = "right", .module = "large_instance" },
+            } },
+            .{ .name = "small_instance", .path = shared, .dependencies = &.{.{ .name = "config", .module = "small" }} },
+            .{ .name = "large_instance", .path = shared, .dependencies = &.{.{ .name = "config", .module = "large" }} },
+            .{ .name = "small", .path = small },
+            .{ .name = "large", .path = large },
         },
-        .size = d.size,
-    };
-    var jitted = try target.native.jitModuleData(a, functions, data);
-    defer jitted.deinit();
-    const check = jitted.entry(*const fn () callconv(.c) u64, "check") orelse return error.NoEntry;
-    try std.testing.expectEqual(@as(u64, 0), check());
-    jitted.dataAddr("ready").?[0] = 1;
-    try std.testing.expectEqual(@as(u64, 1), check());
+    });
+    defer mod.deinit(a);
+    const expected_sources = [_][]const u8{ root, shared, small, large };
+    try std.testing.expectEqual(expected_sources.len, mod.source_files.len);
+    for (expected_sources) |expected_source| {
+        const absolute = try std.Io.Dir.cwd().realPathFileAlloc(io, expected_source, paths);
+        var matches: usize = 0;
+        for (mod.source_files) |actual| {
+            if (std.mem.eql(u8, absolute, actual)) matches += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), matches);
+    }
+    var r = try jitFn(a, &mod, "exercise", *const fn () callconv(.c) u64);
+    defer r.j.deinit();
+    try std.testing.expectEqual(@as(u64, 309), r.f());
+    try std.testing.expectEqual(@as(u64, 410), r.f());
+}
+
+test "recursive imported calls across an import cycle terminate" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "even.zig", .data =
+        \\const odd = @import("odd.zig");
+        \\pub fn isEven(n: u64) bool { if (n == 0) return true; return odd.isOdd(n - 1); }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "odd.zig", .data =
+        \\const even = @import("even.zig");
+        \\pub fn isOdd(n: u64) bool { if (n == 0) return false; return even.isEven(n - 1); }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "root.zig", .data =
+        \\const even = @import("even.zig");
+        \\fn check(n: u64) bool { return even.isEven(n); }
+    });
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path, "root.zig" });
+    defer a.free(path);
+    var mod = try zigc.compileFile(a, io, path, .x86_64, null);
+    defer mod.deinit(a);
+    var r = try jitFn(a, &mod, "check", *const fn (u64) callconv(.c) bool);
+    defer r.j.deinit();
+    try std.testing.expect(r.f(42));
+    try std.testing.expect(!r.f(41));
+}
+
+test "imported pointer calls preserve canonical struct identity" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "shape.zig", .data =
+        \\pub const Item = extern struct { value: u64 };
+        \\pub fn echo(item: *Item) *Item { return item; }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "root.zig", .data =
+        \\const shape = @import("shape.zig");
+        \\fn rootIdentity(item: *shape.Item) *shape.Item { return item; }
+        \\fn roundTrip(item: *shape.Item) *shape.Item { return rootIdentity(shape.echo(item)); }
+    });
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path, "root.zig" });
+    defer a.free(path);
+    var mod = try zigc.compileFile(a, io, path, .x86_64, null);
+    defer mod.deinit(a);
+    var r = try jitFn(a, &mod, "roundTrip", *const fn (*u64) callconv(.c) *u64);
+    defer r.j.deinit();
+    var value: u64 = 42;
+    try std.testing.expectEqual(@intFromPtr(&value), @intFromPtr(r.f(&value)));
+}
+
+test "string slices returned from imported files retain distinct data" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "first.zig", .data =
+        \\pub fn text() []const u8 { return "alpha"; }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "second.zig", .data =
+        \\pub fn text() []const u8 { return "bravo"; }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "root.zig", .data =
+        \\const first = @import("first.zig");
+        \\const second = @import("second.zig");
+        \\fn exercise() usize {
+        \\    const a = first.text();
+        \\    const b = second.text();
+        \\    return a.len + b.len + @intCast(a[0]) + @intCast(b[0]);
+        \\}
+    });
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path, "root.zig" });
+    defer a.free(path);
+    var mod = try zigc.compileFile(a, io, path, .x86_64, null);
+    defer mod.deinit(a);
+    var r = try jitFn(a, &mod, "exercise", *const fn () callconv(.c) usize);
+    defer r.j.deinit();
+    try std.testing.expectEqual(@as(usize, 205), r.f());
+}
+
+test "imported mutable scalar globals resolve through the complete root module" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "state.zig", .data =
+        \\pub var ready: bool = false;
+        \\pub fn markReady() void { ready = true; }
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "root.zig", .data =
+        \\const state = @import("state.zig");
+        \\fn exercise() u64 {
+        \\    if (state.ready) return 0;
+        \\    state.markReady();
+        \\    if (state.ready) return 1;
+        \\    return 2;
+        \\}
+    });
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path, "root.zig" });
+    defer a.free(path);
+    var mod = try zigc.compileFile(a, io, path, .x86_64, null);
+    defer mod.deinit(a);
+    var r = try jitFn(a, &mod, "exercise", *const fn () callconv(.c) u64);
+    defer r.j.deinit();
+    try std.testing.expectEqual(@as(u64, 1), r.f());
 }
 
 test "imported source file itself is a struct type" {
@@ -940,4 +1328,68 @@ test "variadic function definition: @cVaStart/@cVaArg/@cVaEnd sums trailing i64 
     defer jitted.deinit();
     const run = jitted.entry(*const fn () callconv(.c) i64, "caller") orelse return error.NoEntry;
     try std.testing.expectEqual(@as(i64, 60), run());
+}
+
+test "file compilation reports the location of a lowering failure" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "root.zig", .data =
+        \\fn fine() void {}
+        \\fn bad() c_int { return 0; }
+    });
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path, "root.zig" });
+    defer a.free(path);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var diagnostic: zigc.Diagnostic = .{ .path_buffer = &path_buffer };
+    try std.testing.expectError(zigc.Error.UnsupportedType, zigc.compileFileOptions(a, io, path, .x86_64, .{
+        .diagnostic = &diagnostic,
+    }));
+    try std.testing.expectEqual(@as(u32, 2), diagnostic.line);
+    try std.testing.expect(std.mem.endsWith(u8, diagnostic.path(), "root.zig"));
+}
+
+test "test declarations are lowered only when requested and can be filtered" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "root.zig", .data =
+        \\fn add(a: u64, b: u64) u64 { return a + b; }
+        \\test "adds" { _ = add(1, 2); }
+        \\test "other" { const value: u64 = 7; _ = value; }
+    });
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path, "root.zig" });
+    defer a.free(path);
+
+    var plain = try zigc.compileFile(a, io, path, .x86_64, null);
+    defer plain.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), plain.tests.len);
+
+    var all = try zigc.compileFileOptions(a, io, path, .x86_64, .{ .tests = true });
+    defer all.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), all.tests.len);
+    try std.testing.expect(findTest(&all, "adds") != null);
+    try std.testing.expect(findTest(&all, "other") != null);
+
+    var filtered = try zigc.compileFileOptions(a, io, path, .x86_64, .{
+        .tests = true,
+        .test_filters = &.{"add"},
+    });
+    defer filtered.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), filtered.tests.len);
+    try std.testing.expectEqualStrings("adds", filtered.tests[0].name);
+
+    // Lowered tests execute through the same JIT entry point the test runner uses.
+    var r = try jitFn(a, &all, all.tests[0].link_name, *const fn () callconv(.c) void);
+    defer r.j.deinit();
+    r.f();
+}
+
+fn findTest(mod: *const zigc.Module, name: []const u8) ?usize {
+    for (mod.tests, 0..) |test_entry, index| {
+        if (std.mem.eql(u8, test_entry.name, name)) return index;
+    }
+    return null;
 }

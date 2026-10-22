@@ -1,10 +1,10 @@
-//! Lower parsed Zig source (via `std.zig.Ast`) to Vulcan IR. Supports the EXTENDED SUBSET:
-//! top-level functions/data and boolean/integer constants; primitive types (bool/int/float),
-//! single-item and nullable pointers (`*T`, `?*T`), optional 8/16/32/64-bit
-//! integers, fixed-size arrays (`[N]T`), and simple top-level `struct` declarations
-//! with field init/access. No methods, generics, tagged unions, slices, error unions,
-//! or general `defer`; target-dependent `builtin.cpu.arch == .<arch>` and
-//! `defer @cVaEnd` are the two explicit exceptions.
+//! Lower parsed Zig source (via `std.zig.Ast`) to Vulcan IR. Supports top-level
+//! functions/data, primitive scalars, pointers, optionals, fixed-size arrays,
+//! simple structs, slices, and the supported error-union operations.
+//! File compilation emits reached imported top-level functions/data on demand;
+//! root function bodies remain eager. General generics/comptime, tagged unions,
+//! struct method bodies, and general `defer` remain unsupported (`defer @cVaEnd`
+//! is the narrow defer exception).
 //!
 //! `vulcan-ir`'s `TypeKind.@"struct"`/`Extract`/`StructNew` opcodes are High-profile-only
 //! and, as of this frontend, not lowered for a non-vector aggregate by any native backend
@@ -57,12 +57,23 @@ pub const TargetArch = enum { aarch64, x86_64, x86, riscv64 };
 /// A direct `@import` declaration preserved for a later module-resolution stage.
 pub const Import = struct { name: []u8, path: []u8 };
 
-/// A lowered Zig source file: every function and data declaration it defines, plus its direct
+/// One `test` declaration compiled into a callable IR function. `name` is what a
+/// caller displays; `link_name` is the function's name in `Module.funcs`.
+pub const Test = struct {
+    name: []u8,
+    link_name: []u8,
+};
+
+/// Root definitions and reached imported top-level definitions, plus the root's direct
 /// module declarations. Caller owns all slices and strings.
 pub const Module = struct {
     funcs: []NamedFunction,
     data: []Data,
     imports: []Import,
+    /// Tests lowered when `FileCompileOptions.tests` was set.
+    tests: []Test = &.{},
+    /// Normalized absolute source paths, populated only when requested by file compilation.
+    source_files: [][]u8 = &.{},
 
     pub fn deinit(self: *Module, allocator: std.mem.Allocator) void {
         for (self.funcs) |*nf| {
@@ -83,6 +94,15 @@ pub const Module = struct {
         }
         allocator.free(self.imports);
         self.imports = &.{};
+        for (self.tests) |test_entry| {
+            allocator.free(test_entry.name);
+            allocator.free(test_entry.link_name);
+        }
+        allocator.free(self.tests);
+        self.tests = &.{};
+        for (self.source_files) |path| allocator.free(path);
+        allocator.free(self.source_files);
+        self.source_files = &.{};
     }
 
     /// Find a function's IR by its link name, or `null` if the module has none by that name.
@@ -93,6 +113,8 @@ pub const Module = struct {
 };
 
 pub const Error = error{
+    /// A malformed or unresolved named-module graph.
+    InvalidModuleGraph,
     /// `std.zig.Ast.parse` reported one or more syntax errors.
     ParseError,
     /// An AST node whose shape is outside the extended subset (e.g. a tagged union, a
@@ -143,17 +165,49 @@ pub fn compileForTarget(allocator: std.mem.Allocator, source: []const u8, target
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
-    return lowerRoot(allocator, arena_state.allocator(), &tree, target, ".", null);
+    return lowerRoot(allocator, arena_state.allocator(), &tree, target, ".", null, false, &.{});
 }
+
+pub const ModuleDependency = struct {
+    /// Local import alias visible in this module.
+    name: []const u8,
+    /// Identifier of the dependency module.
+    module: []const u8,
+};
 
 pub const ModuleMapping = struct {
     name: []const u8,
     path: []const u8,
+    dependencies: []const ModuleDependency = &.{},
+};
+
+/// Where lowering stopped, for callers that want to report a source location.
+/// `path_buffer` is caller-owned; a diagnostic never allocates.
+pub const Diagnostic = struct {
+    path_buffer: []u8,
+    path_len: usize = 0,
+    /// 1-based, or 0 when no source node was recorded.
+    line: u32 = 0,
+    column: u32 = 0,
+
+    pub fn path(self: *const Diagnostic) []const u8 {
+        return self.path_buffer[0..self.path_len];
+    }
 };
 
 pub const FileCompileOptions = struct {
     std_dir: ?[]const u8 = null,
     modules: []const ModuleMapping = &.{},
+    /// Selects the entry module; its mapped path must resolve to `compileFileOptions`'s `path`.
+    root_module: ?[]const u8 = null,
+    /// Retain every source read during lowering for build-system dependency tracking.
+    collect_source_files: bool = false,
+    /// On failure, receives the deepest source location lowering visited.
+    diagnostic: ?*Diagnostic = null,
+    /// Lower `test` declarations in the root module's files into `Module.tests`.
+    tests: bool = false,
+    /// Keep only tests whose name contains one of these strings; empty keeps all.
+    test_filters: []const []const u8 = &.{},
 };
 
 /// Compile a Zig source file, resolving relative imports beside the importing file,
@@ -169,18 +223,56 @@ pub fn compileFileOptions(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const source = std.Io.Dir.cwd().readFileAllocOptions(io, path, arena, .limited(16 * 1024 * 1024), .of(u8), 0) catch return Error.UnsupportedNode;
-    var tree = try Ast.parse(arena, source, .{});
-    if (tree.errors.len != 0) return Error.ParseError;
-
     var modules = Modules{
         .io = io,
         .arena = arena,
         .std_dir = options.std_dir,
         .named = options.modules,
+        .root_module = options.root_module,
+        .diagnostic = options.diagnostic,
     };
-    const dir = std.fs.path.dirname(path) orelse ".";
-    return lowerRoot(allocator, arena, &tree, target, dir, &modules);
+    try modules.validate();
+    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd_len = std.Io.Dir.cwd().realPath(io, &cwd_buffer) catch return Error.UnsupportedNode;
+    modules.cwd = cwd_buffer[0..cwd_len];
+    const root_module_index = if (options.root_module) |name| modules.moduleIndex(name) orelse return Error.InvalidModuleGraph else null;
+    const source_path = std.fs.path.resolve(arena, &.{ modules.cwd, path }) catch return Error.UnsupportedNode;
+    if (root_module_index) |index| {
+        const mapped_path = std.fs.path.resolve(arena, &.{ modules.cwd, modules.named[index].path }) catch return Error.InvalidModuleGraph;
+        if (!std.mem.eql(u8, source_path, mapped_path)) return Error.InvalidModuleGraph;
+    }
+    const source = std.Io.Dir.cwd().readFileAllocOptions(io, path, arena, .limited(16 * 1024 * 1024), .of(u8), 0) catch return Error.UnsupportedNode;
+    var tree = try Ast.parse(arena, source, .{});
+    if (tree.errors.len != 0) return Error.ParseError;
+    const source_dir = std.fs.path.dirname(source_path) orelse ".";
+    modules.root = .{ .tree = &tree, .dir = source_dir, .module_index = root_module_index, .path = source_path };
+    if (options.tests) modules.loadTestImports() catch |err| {
+        if (options.diagnostic) |diagnostic| modules.fillDiagnostic(diagnostic);
+        return err;
+    };
+    var result = lowerRoot(allocator, arena, &tree, target, source_dir, &modules, options.tests, options.test_filters) catch |err| {
+        if (options.diagnostic) |diagnostic| modules.fillDiagnostic(diagnostic);
+        return err;
+    };
+    errdefer result.deinit(allocator);
+    if (options.collect_source_files) {
+        var paths: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (paths.items) |loaded_path| allocator.free(loaded_path);
+            paths.deinit(allocator);
+        }
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        for (0..modules.files.items.len + 1) |index| {
+            const loaded_path = if (index == 0) source_path else modules.files.items[index - 1].path;
+            const entry = try seen.getOrPut(arena, loaded_path);
+            if (entry.found_existing) continue;
+            const owned_path = try allocator.dupe(u8, loaded_path);
+            errdefer allocator.free(owned_path);
+            try paths.append(allocator, owned_path);
+        }
+        result.source_files = try paths.toOwnedSlice(allocator);
+    }
+    return result;
 }
 
 /// Compatibility entry point for callers that only need relative imports and `std`.
@@ -403,7 +495,10 @@ const ZType = union(enum) {
 
 const StructField = struct { name: []const u8, ty: ZType, offset: u64 };
 const StructDef = struct { name: []const u8, fields: []const StructField, byte_size: u64, alignment: u64 };
-const GlobalDef = struct { zty: ZType };
+const GlobalDef = struct { zty: ZType, symbol: []const u8 };
+const FnDeclInfo = struct { decl_node: Ast.Node.Index, proto_node: Ast.Node.Index, body_node: ?Ast.Node.Index };
+const GlobalDeclInfo = struct { decl_node: Ast.Node.Index };
+const DeclKey = struct { tree: *const Ast, node: Ast.Node.Index };
 const ConstValue = union(enum) { boolean: bool, int: i64 };
 const ConstBinding = struct { name: []const u8, value: i64 };
 
@@ -422,64 +517,147 @@ fn findField(sd: *const StructDef, name: []const u8) ?StructField {
     return null;
 }
 
-/// Shared lowering context: the parsed tree, an arena for every `ZType`/`StructDef` this
-/// frontend synthesizes (freed by `compile` once the whole `Module` is built - only the
-/// `ir.function.Function`s in the returned `Module` outlive it, and those own no `ZType`),
-/// the lazily-resolved struct table, and complete top-level data declarations. `nodes` maps a
-/// struct's declared name to its `container_decl` node (collected by `lowerRoot`'s first pass);
-/// `resolve` turns that into a `StructDef` on first use, memoized in `defs`, with `resolving`
-/// guarding against a self-referential struct (`Error.UnsupportedType`, not an infinite loop).
-/// `globals` is populated before any body is lowered, so a function can refer to a global
-/// declared later in the source.
 /// A parsed file kept alive for the whole `compileFile` compilation (its `Ast` is
 /// `Modules.arena`-owned), together with the directory a relative `@import` reached FROM it
 /// resolves against.
-const LoadedFile = struct { tree: *const Ast, dir: []const u8 };
+const LoadedFile = struct { tree: *const Ast, dir: []const u8, module_index: ?usize, path: []const u8, is_std: bool = false };
+const LoadedEntry = struct { path: []const u8, file: LoadedFile };
 
-/// Resolves and caches every file a `compileFile` root transitively `@import`s, so the same
-/// path is only ever read and parsed once. Absent under `compile`/`compileForTarget` (an
-/// in-memory source string never touches a filesystem).
 const Modules = struct {
     io: std.Io,
-    /// Owns every parsed `Ast`, every path string, and the `files` map itself; freed together
-    /// with the rest of `compileFile`'s lowering arena.
     arena: std.mem.Allocator,
-    /// The Zig standard library's `lib/std` directory, or `null` if the caller did not supply
-    /// one - `@import("std")` then fails closed with `Error.UnsupportedType`.
+    cwd: []const u8 = ".",
     std_dir: ?[]const u8,
-    /// Package-style imports (`@import("soc")`, `@import("build_options")`, etc.). Paths are
-    /// resolved from the process working directory, matching command-line `-Mname=path`.
     named: []const ModuleMapping = &.{},
-    files: std.StringHashMapUnmanaged(LoadedFile) = .empty,
+    root_module: ?[]const u8 = null,
+    root: ?LoadedFile = null,
+    files: std.ArrayList(LoadedEntry) = .empty,
+    diagnostic: ?*Diagnostic = null,
+    last_tree: ?*const Ast = null,
+    last_node: ?Ast.Node.Index = null,
 
-    fn namedPath(self: *const Modules, name: []const u8) ?[]const u8 {
-        for (self.named) |module| {
-            if (std.mem.eql(u8, module.name, name)) return module.path;
-        }
+    /// Record the node most recently being lowered, so a failure after it can name it.
+    fn mark(self: *Modules, tree: *const Ast, node: Ast.Node.Index) void {
+        if (self.diagnostic == null) return;
+        self.last_tree = tree;
+        self.last_node = node;
+    }
+
+    fn fillDiagnostic(self: *const Modules, diagnostic: *Diagnostic) void {
+        const tree = self.last_tree orelse return;
+        const node = self.last_node orelse return;
+        const loaded = self.owner(tree) orelse return;
+        const path = loaded.path[0..@min(loaded.path.len, diagnostic.path_buffer.len)];
+        @memcpy(diagnostic.path_buffer[0..path.len], path);
+        diagnostic.path_len = path.len;
+        const location = tree.tokenLocation(0, tree.nodeMainToken(node));
+        diagnostic.line = @intCast(location.line + 1);
+        diagnostic.column = @intCast(location.column + 1);
+    }
+
+    fn moduleIndex(self: *const Modules, name: []const u8) ?usize {
+        for (self.named, 0..) |module, index| if (std.mem.eql(u8, module.name, name)) return index;
         return null;
     }
 
-    /// Resolve `import_path` to its parsed file, reading and parsing it on first use only.
-    fn load(self: *Modules, from_dir: []const u8, import_path: []const u8) Error!LoadedFile {
-        if (std.mem.eql(u8, import_path, "builtin") or std.mem.eql(u8, import_path, "root")) return Error.UnsupportedType;
-        const abs = if (std.mem.eql(u8, import_path, "std"))
-            std.fs.path.join(self.arena, &.{ self.std_dir orelse return Error.UnsupportedType, "std.zig" }) catch return Error.UnsupportedType
-        else if (self.namedPath(import_path)) |module_path|
-            std.fs.path.resolve(self.arena, &.{module_path}) catch return Error.UnsupportedType
-        else
-            std.fs.path.resolve(self.arena, &.{ from_dir, import_path }) catch return Error.UnsupportedType;
-        return self.loadAbs(abs);
+    fn validate(self: *const Modules) Error!void {
+        for (self.named, 0..) |module, i| {
+            if (module.name.len == 0 or module.path.len == 0) return Error.InvalidModuleGraph;
+            for (self.named[0..i]) |prior| if (std.mem.eql(u8, module.name, prior.name)) return Error.InvalidModuleGraph;
+            for (module.dependencies, 0..) |dep, j| {
+                if (dep.name.len == 0 or dep.module.len == 0 or self.moduleIndex(dep.module) == null) return Error.InvalidModuleGraph;
+                for (module.dependencies[0..j]) |prior| if (std.mem.eql(u8, dep.name, prior.name)) return Error.InvalidModuleGraph;
+            }
+        }
+        if (self.root_module) |root| if (self.moduleIndex(root) == null) return Error.InvalidModuleGraph;
     }
 
-    fn loadAbs(self: *Modules, abs: []const u8) Error!LoadedFile {
-        if (self.files.get(abs)) |f| return f;
+    fn owner(self: *const Modules, tree: *const Ast) ?LoadedFile {
+        if (self.root) |root| if (root.tree == tree) return root;
+        for (self.files.items) |entry| if (entry.file.tree == tree) return entry.file;
+        return null;
+    }
+
+    fn load(self: *Modules, from_tree: *const Ast, import_path: []const u8) Error!LoadedFile {
+        if (std.mem.eql(u8, import_path, "builtin")) return Error.UnsupportedType;
+        const from = self.owner(from_tree) orelse return Error.UnsupportedType;
+        if (std.mem.eql(u8, import_path, "root")) return self.root orelse return Error.UnsupportedType;
+        var target_module_index = from.module_index;
+        var from_std = false;
+        const abs = if (std.mem.eql(u8, import_path, "std")) blk: {
+            target_module_index = null;
+            from_std = true;
+            break :blk try std.fs.path.resolve(self.arena, &.{ self.cwd, self.std_dir orelse return Error.UnsupportedType, "std.zig" });
+        } else blk: {
+            if (from.module_index) |module_index| {
+                const module = self.named[module_index];
+                for (module.dependencies) |dep| if (std.mem.eql(u8, dep.name, import_path)) {
+                    const target_index = self.moduleIndex(dep.module) orelse return Error.InvalidModuleGraph;
+                    target_module_index = target_index;
+                    break :blk try std.fs.path.resolve(self.arena, &.{ self.cwd, self.named[target_index].path });
+                };
+            }
+            if (!std.mem.endsWith(u8, import_path, ".zig")) return Error.UnsupportedType;
+            break :blk try std.fs.path.resolve(self.arena, &.{ from.dir, import_path });
+        };
+        return self.loadAbs(abs, target_module_index, from_std);
+    }
+
+    fn loadAbs(self: *Modules, abs: []const u8, module_index: ?usize, is_std: bool) Error!LoadedFile {
+        if (self.root) |root| if (root.module_index == module_index and std.mem.eql(u8, root.path, abs)) return root;
+        for (self.files.items) |entry| if (entry.file.module_index == module_index and std.mem.eql(u8, entry.path, abs)) return entry.file;
         const source = std.Io.Dir.cwd().readFileAllocOptions(self.io, abs, self.arena, .limited(16 * 1024 * 1024), .of(u8), 0) catch return Error.UnsupportedType;
         const tree = try self.arena.create(Ast);
         tree.* = Ast.parse(self.arena, source, .{}) catch return Error.ParseError;
         if (tree.errors.len != 0) return Error.ParseError;
-        const loaded = LoadedFile{ .tree = tree, .dir = std.fs.path.dirname(abs) orelse "." };
-        try self.files.put(self.arena, abs, loaded);
+        const loaded = LoadedFile{ .tree = tree, .dir = std.fs.path.dirname(abs) orelse ".", .module_index = module_index, .path = abs, .is_std = is_std };
+        try self.files.append(self.arena, .{ .path = abs, .file = loaded });
         return loaded;
+    }
+
+    /// In test mode, every file of the root module is part of the test binary, not just
+    /// the files some function happened to reach. Walk the root module's relative
+    /// imports eagerly so their `test` declarations are discovered. Relative imports
+    /// inherit the importing file's module identity; named dependencies and `std` are
+    /// different modules and are not walked.
+    fn loadTestImports(self: *Modules) Error!void {
+        const root = self.root orelse return;
+        var index: usize = 0;
+        while (true) {
+            const file = if (index == 0)
+                root
+            else if (index - 1 < self.files.items.len)
+                self.files.items[index - 1].file
+            else
+                break;
+            index += 1;
+            if (file.is_std) continue;
+            if (file.module_index != root.module_index) continue;
+            for (file.tree.rootDecls()) |decl| {
+                const vd = file.tree.fullVarDecl(decl) orelse continue;
+                if (file.tree.tokenTag(vd.ast.mut_token) != .keyword_const) continue;
+                const init_node = vd.ast.init_node.unwrap() orelse continue;
+                if (!isImportDecl(file.tree, init_node)) continue;
+                var buf: [2]Ast.Node.Index = undefined;
+                const args = builtinArgs(file.tree, init_node, &buf);
+                const import_path = std.zig.string_literal.parseAlloc(self.arena, file.tree.tokenSlice(file.tree.nodeMainToken(args[0]))) catch return Error.UnsupportedNode;
+                if (std.mem.eql(u8, import_path, "std") or
+                    std.mem.eql(u8, import_path, "builtin") or
+                    std.mem.eql(u8, import_path, "root")) continue;
+                // A name a module dependency owns crosses a module boundary.
+                var is_dependency = false;
+                if (file.module_index) |module_index| {
+                    for (self.named[module_index].dependencies) |dependency| {
+                        if (std.mem.eql(u8, dependency.name, import_path)) {
+                            is_dependency = true;
+                            break;
+                        }
+                    }
+                }
+                if (is_dependency) continue;
+                _ = try self.load(file.tree, import_path);
+            }
+        }
     }
 };
 
@@ -487,6 +665,8 @@ const Modules = struct {
 /// `container_decl` node together with the file it lives in (the same node index can appear
 /// in many different trees).
 const ForeignKey = struct { tree: *const Ast, node: Ast.Node.Index };
+/// One file's source-level namespace. All contexts in a compilation share declaration
+/// worklists, link names, literal numbering, and canonical struct identities in `Compiler`.
 const Ctx = struct {
     tree: *const Ast,
     /// `tree`'s own directory, used to resolve a relative `@import(...)` reached from it.
@@ -505,17 +685,12 @@ const Ctx = struct {
     resolving: std.StringHashMapUnmanaged(void) = .empty,
     globals: std.StringHashMapUnmanaged(GlobalDef) = .empty,
     constants: std.StringHashMapUnmanaged(ConstValue) = .empty,
-    /// Comptime-only declarations are evaluated on demand. Their AST nodes remain
-    /// available for forward references, while unused unsupported initializers do
-    /// not enter runtime data or prevent compilation.
     deferred_constants: std.StringHashMapUnmanaged(Ast.Node.Index) = .empty,
-    /// Struct layouts reached through a qualified name (`uefi.Guid`), keyed by the defining
-    /// `container_decl` node in ITS OWN file's tree (never `self.tree`'s `nodes`/`defs`, which
-    /// only ever hold `self.tree`'s own locally-declared structs by name).
-    foreign_defs: std.AutoHashMapUnmanaged(ForeignKey, *const StructDef) = .empty,
+    compiler: *Compiler,
+    is_root: bool = false,
+    function_decls: std.StringHashMapUnmanaged(FnDeclInfo) = .empty,
+    global_decls: std.StringHashMapUnmanaged(GlobalDeclInfo) = .empty,
     literal_data: std.ArrayList(Data) = .empty,
-    next_literal_id: u64 = 0,
-    foreign_resolving: std.AutoHashMapUnmanaged(ForeignKey, void) = .empty,
     inferred_error_names: std.ArrayList([]const u8) = .empty,
 
     fn addInferredError(self: *Ctx, name: []const u8) Error!void {
@@ -535,6 +710,8 @@ const Ctx = struct {
         if (self.defs.get(name)) |d| return d;
         if (self.resolving.contains(name)) return Error.UnsupportedType;
         const node = self.nodes.get(name) orelse return Error.UnsupportedType;
+        const key = ForeignKey{ .tree = self.tree, .node = node };
+        if (self.compiler.foreign_defs.get(key)) |def| return def;
         try self.resolving.put(self.arena, name, {});
 
         var buf: [2]Ast.Node.Index = undefined;
@@ -561,8 +738,91 @@ const Ctx = struct {
             .alignment = alignment,
         };
         try self.defs.put(self.arena, name, def);
+        try self.compiler.foreign_defs.put(self.arena, key, def);
         _ = self.resolving.remove(name);
         return def;
+    }
+};
+
+const FunctionEntry = struct {
+    ctx: *Ctx,
+    info: FnDeclInfo,
+    symbol: []const u8,
+    sig: FnSig,
+    is_local: bool,
+};
+const Compiler = struct {
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    target: TargetArch,
+    modules: ?*Modules,
+    root_ctx: *Ctx,
+    contexts: std.ArrayList(*Ctx) = .empty,
+    context_by_tree: std.AutoHashMapUnmanaged(*const Ast, *Ctx) = .empty,
+    foreign_defs: std.AutoHashMapUnmanaged(ForeignKey, *const StructDef) = .empty,
+    foreign_resolving: std.AutoHashMapUnmanaged(ForeignKey, void) = .empty,
+    functions: std.AutoHashMapUnmanaged(DeclKey, FunctionEntry) = .empty,
+    function_queue: std.ArrayList(DeclKey) = .empty,
+    data: std.ArrayList(Data) = .empty,
+    next_link_id: u64 = 0,
+    next_literal_id: u64 = 0,
+
+    fn linkName(self: *Compiler, source_name: []const u8, external: bool) Error![]const u8 {
+        if (external) return source_name;
+        const name = try std.fmt.allocPrint(self.arena, ".vulcan.{d}.{s}", .{ self.next_link_id, source_name });
+        self.next_link_id += 1;
+        return name;
+    }
+
+    fn contextFor(self: *Compiler, tree: *const Ast) Error!*Ctx {
+        if (tree == self.root_ctx.tree) return self.root_ctx;
+        if (self.context_by_tree.get(tree)) |ctx| return ctx;
+        const owner = (self.modules orelse return Error.UnsupportedType).owner(tree) orelse return Error.UnsupportedType;
+        const ctx = try self.arena.create(Ctx);
+        ctx.* = .{
+            .tree = tree,
+            .dir = owner.dir,
+            .arena = self.arena,
+            .target = self.target,
+            .modules = self.modules,
+            .compiler = self,
+        };
+        for (0..tree.nodes.len) |node_idx| {
+            if (tree.nodes.items(.tag)[node_idx] == .error_value) {
+                const node: Ast.Node.Index = @fromBackingInt(@intCast(node_idx));
+                try ctx.addInferredError(tree.tokenSlice(tree.nodeMainToken(node) + 2));
+            }
+        }
+        for (tree.rootDecls()) |decl| {
+            if (self.modules) |modules| modules.mark(tree, decl);
+            const is_definition = tree.nodeTag(decl) == .fn_decl;
+            const proto_node = if (is_definition) tree.nodeData(decl).node_and_node[0] else decl;
+            var proto_buf: [1]Ast.Node.Index = undefined;
+            if (tree.fullFnProto(&proto_buf, proto_node)) |proto| {
+                const token = proto.name_token orelse continue;
+                try ctx.function_decls.put(self.arena, tree.tokenSlice(token), .{
+                    .decl_node = decl,
+                    .proto_node = proto_node,
+                    .body_node = if (is_definition) tree.nodeData(decl).node_and_node[1] else null,
+                });
+            } else if (tree.fullVarDecl(decl)) |vd| {
+                const name = tree.tokenSlice(vd.ast.mut_token + 1);
+                if (vd.ast.init_node.unwrap()) |init_node| {
+                    var container_buf: [2]Ast.Node.Index = undefined;
+                    if (tree.fullContainerDecl(&container_buf, init_node)) |container| {
+                        if (tree.tokenTag(container.ast.main_token) == .keyword_struct)
+                            try ctx.nodes.put(self.arena, name, init_node);
+                        continue;
+                    }
+                    if (tree.tokenTag(vd.ast.mut_token) == .keyword_const and vd.ast.type_node.unwrap() == null)
+                        try ctx.deferred_constants.put(self.arena, name, init_node);
+                }
+                try ctx.global_decls.put(self.arena, name, .{ .decl_node = decl });
+            }
+        }
+        try self.context_by_tree.put(self.arena, tree, ctx);
+        try self.contexts.append(self.arena, ctx);
+        return ctx;
     }
 };
 
@@ -583,13 +843,17 @@ fn findRootConstInit(tree: *const Ast, name: []const u8) ?Ast.Node.Index {
     return null;
 }
 
-const RootGlobalType = struct { type_node: ?Ast.Node.Index, init_node: ?Ast.Node.Index };
+const RootGlobalType = struct { type_node: ?Ast.Node.Index, init_node: ?Ast.Node.Index, is_const: bool };
 
 fn findRootGlobalType(tree: *const Ast, name: []const u8) ?RootGlobalType {
     for (tree.rootDecls()) |decl| {
         const vd = tree.fullVarDecl(decl) orelse continue;
         if (std.mem.eql(u8, tree.tokenSlice(vd.ast.mut_token + 1), name))
-            return .{ .type_node = vd.ast.type_node.unwrap(), .init_node = vd.ast.init_node.unwrap() };
+            return .{
+                .type_node = vd.ast.type_node.unwrap(),
+                .init_node = vd.ast.init_node.unwrap(),
+                .is_const = tree.tokenTag(vd.ast.mut_token) == .keyword_const,
+            };
     }
     return null;
 }
@@ -624,7 +888,7 @@ fn followInit(ctx: *Ctx, tree: *const Ast, dir: []const u8, init_node: Ast.Node.
         const args = builtinArgs(tree, init_node, &buf);
         const path = std.zig.string_literal.parseAlloc(ctx.arena, tree.tokenSlice(tree.nodeMainToken(args[0]))) catch return Error.UnsupportedNode;
         const modules = ctx.modules orelse return Error.UnsupportedType;
-        const loaded = try modules.load(dir, path);
+        const loaded = try modules.load(tree, path);
         return .{ .tree = loaded.tree, .dir = loaded.dir, .node = null };
     }
     return switch (tree.nodeTag(init_node)) {
@@ -639,6 +903,10 @@ fn followInit(ctx: *Ctx, tree: *const Ast, dir: []const u8, init_node: Ast.Node.
 /// struct-literal's own type expression - a plain in-scope local/param/global identifier
 /// never reaches this (see `lowerAddr`/`findBinding` for that).
 fn resolveQualifiedName(ctx: *Ctx, tree: *const Ast, dir: []const u8, node: Ast.Node.Index) Error!Resolved {
+    if (ctx.modules) |modules| modules.mark(tree, node);
+    if (isImportDecl(tree, node) or
+        (isBuiltinCallTag(tree.nodeTag(node)) and std.mem.eql(u8, builtinName(tree, node), "@This")))
+        return followInit(ctx, tree, dir, node);
     switch (tree.nodeTag(node)) {
         .identifier => {
             const name = tree.tokenSlice(tree.nodeMainToken(node));
@@ -670,10 +938,14 @@ fn resolveQualifiedName(ctx: *Ctx, tree: *const Ast, dir: []const u8, node: Ast.
 /// so their fields need only agree across files compiled by this frontend.
 /// Packed structs remain unsupported; explicit field alignment is not modeled.
 fn resolveForeignStruct(ctx: *Ctx, tree: *const Ast, dir: []const u8, node: Ast.Node.Index) Error!*const StructDef {
+    if (tree == ctx.tree) {
+        var local_it = ctx.nodes.iterator();
+        while (local_it.next()) |entry| if (entry.value_ptr.* == node) return ctx.resolve(entry.key_ptr.*);
+    }
     const key = ForeignKey{ .tree = tree, .node = node };
-    if (ctx.foreign_defs.get(key)) |d| return d;
-    if (ctx.foreign_resolving.contains(key)) return Error.UnsupportedType;
-    try ctx.foreign_resolving.put(ctx.arena, key, {});
+    if (ctx.compiler.foreign_defs.get(key)) |d| return d;
+    if (ctx.compiler.foreign_resolving.contains(key)) return Error.UnsupportedType;
+    try ctx.compiler.foreign_resolving.put(ctx.arena, key, {});
 
     var buf: [2]Ast.Node.Index = undefined;
     const cd = tree.fullContainerDecl(&buf, node) orelse return Error.UnsupportedType;
@@ -703,8 +975,8 @@ fn resolveForeignStruct(ctx: *Ctx, tree: *const Ast, dir: []const u8, node: Ast.
         .byte_size = alignForward(offset, alignment),
         .alignment = alignment,
     };
-    try ctx.foreign_defs.put(ctx.arena, key, def);
-    _ = ctx.foreign_resolving.remove(key);
+    try ctx.compiler.foreign_defs.put(ctx.arena, key, def);
+    _ = ctx.compiler.foreign_resolving.remove(key);
     return def;
 }
 fn resolveContainerTypeIn(ctx: *Ctx, tree: *const Ast, dir: []const u8, node: Ast.Node.Index) Error!ZType {
@@ -727,6 +999,7 @@ fn resolveType(ctx: *Ctx, node: Ast.Node.Index) Error!ZType {
 }
 
 fn resolveTypeIn(ctx: *Ctx, tree: *const Ast, dir: []const u8, node: Ast.Node.Index) Error!ZType {
+    if (ctx.modules) |modules| modules.mark(tree, node);
     switch (tree.nodeTag(node)) {
         .identifier => {
             const name = tree.tokenSlice(tree.nodeMainToken(node));
@@ -1079,6 +1352,67 @@ fn lowerGlobalData(
     return .{ .name = owned_name, .bytes = bytes, .kind = kind, .size = bytes.len };
 }
 
+fn ensureGlobal(ctx: *Ctx, name: []const u8) Error!?GlobalDef {
+    if (ctx.globals.get(name)) |global| return global;
+    const global_info = ctx.global_decls.get(name) orelse return null;
+    const tree = ctx.tree;
+    const decl = global_info.decl_node;
+    const vd = tree.fullVarDecl(decl) orelse return Error.UnsupportedNode;
+    const init_node = vd.ast.init_node.unwrap();
+    const is_const = tree.tokenTag(vd.ast.mut_token) == .keyword_const;
+    const is_extern = if (vd.extern_export_token) |token|
+        tree.tokenTag(token) == .keyword_extern
+    else
+        false;
+    const is_export = declarationHasModifier(tree, decl, .keyword_export);
+    const symbol = try ctx.compiler.linkName(name, ctx.is_root or is_export or is_extern);
+    if (init_node == null and !is_extern) return Error.UnsupportedNode;
+    const type_node = vd.ast.type_node.unwrap();
+    if (type_node == null and init_node != null) {
+        if (utf16LiteralArg(tree, init_node.?)) |string_node| {
+            const encoded = try encodeUtf16LiteralGlobal(ctx.compiler.gpa, ctx.arena, tree, string_node);
+            const kind: DataKind = if (is_const) .rodata else if (allZero(encoded.bytes)) .bss else .data;
+            const bytes = if (kind == .bss) blk: {
+                ctx.compiler.gpa.free(encoded.bytes);
+                break :blk try ctx.compiler.gpa.alloc(u8, 0);
+            } else encoded.bytes;
+            errdefer ctx.compiler.gpa.free(bytes);
+            const data_name = try ctx.compiler.gpa.dupe(u8, symbol);
+            errdefer ctx.compiler.gpa.free(data_name);
+            const global = GlobalDef{ .zty = encoded.zty, .symbol = symbol };
+            try ctx.globals.put(ctx.arena, name, global);
+            try ctx.compiler.data.append(ctx.arena, .{
+                .name = data_name,
+                .bytes = bytes,
+                .kind = kind,
+                .size = encoded.zty.byteSize(),
+            });
+            return global;
+        }
+    }
+    const zty = if (type_node) |node|
+        try resolveType(ctx, node)
+    else if (init_node) |node| blk: {
+        if (!isStructInitTag(tree.nodeTag(node))) return Error.UnsupportedType;
+        var init_buf: [2]Ast.Node.Index = undefined;
+        const init = tree.fullStructInit(&init_buf, node) orelse return Error.UnsupportedNode;
+        const type_expr = init.ast.type_expr.unwrap() orelse return Error.UnsupportedType;
+        break :blk try resolveType(ctx, type_expr);
+    } else return Error.UnsupportedType;
+    const global = GlobalDef{ .zty = zty, .symbol = symbol };
+    try ctx.globals.put(ctx.arena, name, global);
+    if (is_extern) return global;
+    const init = init_node orelse return Error.UnsupportedNode;
+    const constant = evalTopConst(ctx, init);
+    const data = try lowerGlobalData(ctx.compiler.gpa, tree, symbol, zty, is_const, init, constant);
+    errdefer {
+        ctx.compiler.gpa.free(data.name);
+        ctx.compiler.gpa.free(data.bytes);
+    }
+    try ctx.compiler.data.append(ctx.arena, data);
+    return global;
+}
+
 fn isStructInitTag(tag: Ast.Node.Tag) bool {
     return switch (tag) {
         .struct_init_one, .struct_init_one_comma, .struct_init_dot_two, .struct_init_dot_two_comma, .struct_init_dot, .struct_init_dot_comma, .struct_init, .struct_init_comma => true,
@@ -1197,7 +1531,7 @@ fn evalBuiltinArchEqual(ctx: *const Ctx, node: Ast.Node.Index) ?bool {
     return arch == ctx.target;
 }
 
-fn evalConstInt(ctx: *const Ctx, tree: *const Ast, node: Ast.Node.Index, bindings: []const ConstBinding, depth: u8) ?i64 {
+fn evalConstInt(ctx: *Ctx, tree: *const Ast, node: Ast.Node.Index, bindings: []const ConstBinding, depth: u8) ?i64 {
     if (depth == 32) return null;
     switch (tree.nodeTag(node)) {
         .number_literal => return switch (std.zig.number_literal.parseNumberLiteral(tree.tokenSlice(tree.nodeMainToken(node)))) {
@@ -1214,10 +1548,26 @@ fn evalConstInt(ctx: *const Ctx, tree: *const Ast, node: Ast.Node.Index, binding
                     .int => |integer| return integer,
                     .boolean => {},
                 };
-                if (ctx.deferred_constants.get(name) orelse findRootConstInit(tree, name)) |init|
-                    return evalConstInt(ctx, tree, init, &.{}, depth + 1);
             }
-            return null;
+            const global = findRootGlobalType(tree, name) orelse return null;
+            if (!global.is_const) return null;
+            const init = global.init_node orelse return null;
+            return evalConstInt(ctx, tree, init, &.{}, depth + 1);
+        },
+        .field_access => {
+            const access = tree.nodeData(node).node_and_token;
+            const dir = if (ctx.tree == tree)
+                ctx.dir
+            else if (ctx.modules) |modules|
+                (modules.owner(tree) orelse return null).dir
+            else
+                return null;
+            const resolved = resolveQualifiedName(ctx, tree, dir, access[0]) catch return null;
+            if (resolved.node != null) return null;
+            const global = findRootGlobalType(resolved.tree, tree.tokenSlice(access[1])) orelse return null;
+            if (!global.is_const) return null;
+            const init = global.init_node orelse return null;
+            return evalConstInt(ctx, resolved.tree, init, &.{}, depth + 1);
         },
         .grouped_expression => return evalConstInt(ctx, tree, tree.nodeData(node).node_and_token[0], bindings, depth + 1),
         .negation => {
@@ -1298,7 +1648,7 @@ fn evalConstInt(ctx: *const Ctx, tree: *const Ast, node: Ast.Node.Index, binding
     }
 }
 
-fn evalTopConst(ctx: *const Ctx, node: Ast.Node.Index) ?ConstValue {
+fn evalTopConst(ctx: *Ctx, node: Ast.Node.Index) ?ConstValue {
     if (evalBuiltinArchEqual(ctx, node)) |value| return .{ .boolean = value };
     if (ctx.tree.nodeTag(node) == .identifier) {
         const name = ctx.tree.tokenSlice(ctx.tree.nodeMainToken(node));
@@ -1308,7 +1658,7 @@ fn evalTopConst(ctx: *const Ctx, node: Ast.Node.Index) ?ConstValue {
     return .{ .int = evalConstInt(ctx, ctx.tree, node, &.{}, 0) orelse return null };
 }
 
-fn evalDeferredConst(ctx: *const Ctx, name: []const u8, depth: u8) ?ConstValue {
+fn evalDeferredConst(ctx: *Ctx, name: []const u8, depth: u8) ?ConstValue {
     if (depth == 32) return null;
     if (ctx.constants.get(name)) |value| return value;
     const init = ctx.deferred_constants.get(name) orelse return null;
@@ -1423,9 +1773,8 @@ fn collectImports(allocator: std.mem.Allocator, tree: *const Ast) Error![]Import
     return result.toOwnedSlice(allocator);
 }
 
-/// An import-only alias has no run-time representation. Keeping it out of the IR is safe only
-/// until a lowered declaration names it; that use still fails closed in `resolveType` or
-/// `lowerExpr` instead of fabricating an imported value.
+/// Import namespace aliases have no runtime storage. File compilation resolves the
+/// declarations reached through them and emits supported runtime definitions on demand.
 fn isImportNamespace(tree: *const Ast, node: Ast.Node.Index, imports: *const std.StringHashMapUnmanaged(void)) bool {
     if (isImportDecl(tree, node)) return true;
     if (tree.nodeTag(node) != .field_access) return false;
@@ -1449,35 +1798,90 @@ fn findFnSig(sigs: []const FnSig, name: []const u8) ?FnSig {
     return null;
 }
 
+fn declarationHasModifier(tree: *const Ast, decl: Ast.Node.Index, keyword: std.zig.Token.Tag) bool {
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    if (tree.fullFnProto(&proto_buf, decl)) |proto| {
+        const token = proto.extern_export_inline_token orelse return false;
+        return tree.tokenTag(token) == keyword;
+    }
+    if (tree.fullVarDecl(decl)) |vd| {
+        const token = vd.extern_export_token orelse return false;
+        return tree.tokenTag(token) == keyword;
+    }
+    return false;
+}
+
+fn buildFunctionSig(ctx: *Ctx, proto_node: Ast.Node.Index, symbol: []const u8) Error!FnSig {
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    const proto = ctx.tree.fullFnProto(&proto_buf, proto_node) orelse return Error.UnsupportedNode;
+    const ret_node = proto.ast.return_type.unwrap() orelse return Error.UnsupportedType;
+    const ret: ?ZType = try resolveFnReturnType(ctx, ctx.tree, ctx.dir, ret_node);
+    if (ret) |rz| {
+        if ((rz.isAggregate() and rz != .optional_value and rz != .slice and rz != .error_union) or (rz.optionalPayloadIsAggregate() and (ctx.target != .aarch64 or rz.byteSize() <= 16))) return Error.UnsupportedType;
+        if (rz == .error_union and rz.byteSize() > 16 and ctx.target != .aarch64) return Error.UnsupportedType;
+    }
+    var params: std.ArrayList(ZType) = .empty;
+    var variadic = false;
+    var iter = proto.iterate(ctx.tree);
+    while (iter.next()) |param| {
+        if (param.comptime_noalias) |token| {
+            if (ctx.tree.tokenTag(token) == .keyword_comptime) return Error.UnsupportedType;
+        }
+        if (param.anytype_ellipsis3) |tok| {
+            if (ctx.tree.tokenTag(tok) != .ellipsis3) return Error.UnsupportedType;
+            variadic = true;
+            break;
+        }
+        const type_node = param.type_expr orelse return Error.UnsupportedType;
+        const zty = try resolveType(ctx, type_node);
+        if ((zty.isAggregate() and zty != .optional_value and zty != .slice) or zty.optionalPayloadIsAggregate()) return Error.UnsupportedType;
+        try params.append(ctx.arena, zty);
+    }
+    return .{
+        .name = symbol,
+        .params = try params.toOwnedSlice(ctx.arena),
+        .ret = ret,
+        .is_variadic = variadic,
+        .is_noreturn = isNoReturnType(ctx.tree, ret_node),
+    };
+}
+
+fn ensureFunction(ctx: *Ctx, name: []const u8) Error!?FnSig {
+    const info = ctx.function_decls.get(name) orelse return null;
+    const key = DeclKey{ .tree = ctx.tree, .node = info.proto_node };
+    if (ctx.compiler.functions.get(key)) |entry| return entry.sig;
+    const is_extern = info.body_node == null;
+    const is_export = declarationHasModifier(ctx.tree, info.decl_node, .keyword_export);
+    const external = is_extern or is_export;
+    const symbol = try ctx.compiler.linkName(name, ctx.is_root or external);
+    const sig = try buildFunctionSig(ctx, info.proto_node, symbol);
+    const entry = FunctionEntry{
+        .ctx = ctx,
+        .info = info,
+        .symbol = symbol,
+        .sig = sig,
+        .is_local = !ctx.is_root and !external,
+    };
+    try ctx.compiler.functions.put(ctx.arena, key, entry);
+    if (!ctx.is_root and !is_extern) {
+        try ctx.compiler.function_queue.append(ctx.arena, key);
+    }
+    return sig;
+}
+
+fn ensureLocalFnSig(l: *L, name: []const u8) Error!?FnSig {
+    if (findFnSig(l.fn_sigs, name)) |sig| return sig;
+    return ensureFunction(l.r, name);
+}
+
 fn importedFnSig(l: *L, fn_expr: Ast.Node.Index) Error!?FnSig {
     if (l.r.tree.nodeTag(fn_expr) != .field_access) return null;
     const access = l.r.tree.nodeData(fn_expr).node_and_token;
     const resolved = resolveQualifiedName(l.r, l.r.tree, l.r.dir, access[0]) catch return null;
     if (resolved.node != null) return null;
     const name = l.r.tree.tokenSlice(access[1]);
-    for (resolved.tree.rootDecls()) |decl| {
-        var proto_buf: [1]Ast.Node.Index = undefined;
-        const proto = resolved.tree.fullFnProto(&proto_buf, decl) orelse continue;
-        const name_token = proto.name_token orelse continue;
-        if (!std.mem.eql(u8, resolved.tree.tokenSlice(name_token), name)) continue;
-        const ret_node = proto.ast.return_type.unwrap() orelse return Error.UnsupportedType;
-        const is_noreturn = isNoReturnType(resolved.tree, ret_node);
-        const ret: ?ZType = try resolveFnReturnType(l.r, resolved.tree, resolved.dir, ret_node);
-        var params: std.ArrayList(ZType) = .empty;
-        var iter = proto.iterate(resolved.tree);
-        while (iter.next()) |param| {
-            if (param.anytype_ellipsis3 != null) return null;
-            const type_node = param.type_expr orelse return Error.UnsupportedType;
-            try params.append(l.r.arena, try resolveTypeIn(l.r, resolved.tree, resolved.dir, type_node));
-        }
-        return FnSig{
-            .name = name,
-            .params = try params.toOwnedSlice(l.r.arena),
-            .ret = ret,
-            .is_noreturn = is_noreturn,
-        };
-    }
-    return null;
+    const imported_ctx = try l.r.compiler.contextFor(resolved.tree);
+    return ensureFunction(imported_ctx, name);
 }
 
 fn foreignMethodSig(l: *L, receiver: ZType, method_name: []const u8) Error!?FnSig {
@@ -1487,7 +1891,7 @@ fn foreignMethodSig(l: *L, receiver: ZType, method_name: []const u8) Error!?FnSi
         else => return null,
     };
     var found: ?ForeignKey = null;
-    var foreign_it = l.r.foreign_defs.iterator();
+    var foreign_it = l.r.compiler.foreign_defs.iterator();
     while (foreign_it.next()) |entry| {
         if (entry.value_ptr.* == struct_def) {
             found = entry.key_ptr.*;
@@ -1496,13 +1900,8 @@ fn foreignMethodSig(l: *L, receiver: ZType, method_name: []const u8) Error!?FnSi
     }
     const key = found orelse return null;
     const modules = l.r.modules orelse return null;
-    var method_dir: ?[]const u8 = null;
-    var file_it = modules.files.iterator();
-    while (file_it.next()) |entry| if (entry.value_ptr.tree == key.tree) {
-        method_dir = entry.value_ptr.dir;
-        break;
-    };
-    const dir = method_dir orelse return null;
+    const owner = modules.owner(key.tree) orelse return null;
+    const dir = owner.dir;
     var decl_buf: [2]Ast.Node.Index = undefined;
     const container = key.tree.fullContainerDecl(&decl_buf, key.node) orelse return null;
     for (container.ast.members) |member| {
@@ -1795,18 +2194,22 @@ fn lowerAddr(l: *L, node: Ast.Node.Index) Error!TypedValue {
         .identifier => {
             const name = tree.tokenSlice(tree.nodeMainToken(node));
             if (findBinding(l, name)) |binding| return .{ .value = binding.addr, .zty = binding.zty };
-            const global = l.r.globals.get(name) orelse {
-                if (findFnSig(l.fn_sigs, name) != null) {
-                    const ptrt = try l.func.types.ptrGlobal();
-                    const fn_ptr = try l.r.arena.create(ZType);
-                    fn_ptr.* = .opaque_type;
-                    return .{ .value = try l.func.appendGlobalAddr(l.block, ptrt, name), .zty = .{ .ptr = fn_ptr } };
-                }
-                if (l.r.deferred_constants.contains(name)) return Error.UnsupportedType;
-                return Error.UndeclaredIdentifier;
+            const global = if (l.r.globals.get(name)) |known|
+                known
+            else if (try ensureGlobal(l.r, name)) |reached|
+                reached
+            else {
+                const sig = try ensureLocalFnSig(l, name) orelse {
+                    if (l.r.deferred_constants.contains(name)) return Error.UnsupportedType;
+                    return Error.UndeclaredIdentifier;
+                };
+                const ptrt = try l.func.types.ptrGlobal();
+                const fn_ptr = try l.r.arena.create(ZType);
+                fn_ptr.* = .opaque_type;
+                return .{ .value = try l.func.appendGlobalAddr(l.block, ptrt, sig.name), .zty = .{ .ptr = fn_ptr } };
             };
             const ptrt = try l.func.types.ptrGlobal();
-            return .{ .value = try l.func.appendGlobalAddr(l.block, ptrt, name), .zty = global.zty };
+            return .{ .value = try l.func.appendGlobalAddr(l.block, ptrt, global.symbol), .zty = global.zty };
         },
         .deref => {
             const inner_node = tree.nodeData(node).node;
@@ -1835,18 +2238,17 @@ fn lowerAddr(l: *L, node: Ast.Node.Index) Error!TypedValue {
         .field_access => {
             const d = tree.nodeData(node).node_and_token;
             const qualified_base = resolveQualifiedName(l.r, tree, l.r.dir, d[0]) catch null;
-            if (qualified_base) |resolved| if (resolved.tree != tree and resolved.node == null) {
+            if (qualified_base) |resolved| if (resolved.node == null) {
                 const field_name = tree.tokenSlice(d[1]);
-                const global = findRootGlobalType(resolved.tree, field_name) orelse return Error.UnsupportedType;
-                const zty: ZType = if (global.type_node) |tn|
-                    try resolveTypeIn(l.r, resolved.tree, resolved.dir, tn)
-                else if (global.init_node) |init_node| switch (resolved.tree.nodeTag(init_node)) {
-                    .identifier => .boolean,
-                    .number_literal => .{ .int = .{ .signed = true, .bits = 64 } },
-                    else => return Error.UnsupportedType,
-                } else return Error.UnsupportedType;
+                const imported_ctx = try l.r.compiler.contextFor(resolved.tree);
                 const ptrt = try l.func.types.ptrGlobal();
-                return .{ .value = try l.func.appendGlobalAddr(l.block, ptrt, field_name), .zty = zty };
+                if (try ensureGlobal(imported_ctx, field_name)) |global| {
+                    return .{ .value = try l.func.appendGlobalAddr(l.block, ptrt, global.symbol), .zty = global.zty };
+                }
+                const sig = (try ensureFunction(imported_ctx, field_name)) orelse return Error.UnsupportedType;
+                const fn_ptr = try l.r.arena.create(ZType);
+                fn_ptr.* = .opaque_type;
+                return .{ .value = try l.func.appendGlobalAddr(l.block, ptrt, sig.name), .zty = .{ .ptr = fn_ptr } };
             };
             const base = try lowerExpr(l, d[0], null);
             if (base.zty == .slice) {
@@ -2439,7 +2841,8 @@ fn lowerCall(l: *L, node: Ast.Node.Index) Error!?TypedValue {
     } else {
         fname = tree.tokenSlice(tree.nodeMainToken(c.ast.fn_expr));
         if (l.r.deferred_constants.contains(fname)) return Error.UnsupportedType;
-        sig = findFnSig(l.fn_sigs, fname) orelse return Error.UndeclaredIdentifier;
+        sig = try ensureLocalFnSig(l, fname) orelse return Error.UndeclaredIdentifier;
+        fname = sig.name;
     }
     const params = if (method_receiver != null) sig.params[1..] else sig.params;
     if (method_receiver != null and sig.params.len == 0) return Error.CallArityMismatch;
@@ -2865,7 +3268,8 @@ fn callReturnType(l: *L, node: Ast.Node.Index) Error!?ZType {
     const call = l.r.tree.fullCall(&buf, node) orelse return null;
     if (l.r.tree.nodeTag(call.ast.fn_expr) == .identifier) {
         const name = l.r.tree.tokenSlice(l.r.tree.nodeMainToken(call.ast.fn_expr));
-        return (findFnSig(l.fn_sigs, name) orelse return null).ret;
+        const sig = try ensureLocalFnSig(l, name) orelse return null;
+        return sig.ret;
     }
     if (l.r.tree.nodeTag(call.ast.fn_expr) == .field_access) {
         const sig = try importedFnSig(l, call.ast.fn_expr) orelse return null;
@@ -3056,9 +3460,10 @@ fn importedIntegerConstant(l: *L, node: Ast.Node.Index, expected: ?ZType) Error!
     if (tree.nodeTag(node) != .field_access) return null;
     const access = tree.nodeData(node).node_and_token;
     const resolved = resolveQualifiedName(l.r, tree, l.r.dir, access[0]) catch return null;
-    if (resolved.tree == tree) return null;
+    if (resolved.node != null) return null;
     const field_name = tree.tokenSlice(access[1]);
     const global = findRootGlobalType(resolved.tree, field_name) orelse return null;
+    if (!global.is_const) return null;
     const init_node = global.init_node orelse return null;
     const value = evalConstInt(l.r, resolved.tree, init_node, &.{}, 0) orelse return null;
     const zty = if (expected) |ty|
@@ -3152,8 +3557,8 @@ fn lowerStringLiteral(l: *L, node: Ast.Node.Index, expected: ?ZType) Error!Typed
         slice_type.slice.int.signed or slice_type.slice.int.bits != 8)
         return Error.UnsupportedType;
     const text = std.zig.string_literal.parseAlloc(l.r.arena, tree.tokenSlice(tree.nodeMainToken(node))) catch return Error.UnsupportedNode;
-    const name = try std.fmt.allocPrint(l.r.arena, "__vulcan_literal_{d}", .{l.r.next_literal_id});
-    l.r.next_literal_id += 1;
+    const name = try std.fmt.allocPrint(l.r.arena, ".vulcan.literal.{d}", .{l.r.compiler.next_literal_id});
+    l.r.compiler.next_literal_id += 1;
     const bytes = try l.r.arena.alloc(u8, text.len + 1);
     @memcpy(bytes[0..text.len], text);
     bytes[text.len] = 0;
@@ -3169,8 +3574,8 @@ fn lowerStringLiteral(l: *L, node: Ast.Node.Index, expected: ?ZType) Error!Typed
     return .{ .value = slot, .zty = slice_type };
 }
 fn appendLiteralSlice(l: *L, text: []const u8) Error!TypedValue {
-    const name = try std.fmt.allocPrint(l.r.arena, "__vulcan_literal_{d}", .{l.r.next_literal_id});
-    l.r.next_literal_id += 1;
+    const name = try std.fmt.allocPrint(l.r.arena, ".vulcan.literal.{d}", .{l.r.compiler.next_literal_id});
+    l.r.compiler.next_literal_id += 1;
     const bytes = try l.r.arena.alloc(u8, text.len + 1);
     @memcpy(bytes[0..text.len], text);
     bytes[text.len] = 0;
@@ -3292,6 +3697,7 @@ fn lowerExpectedErrorUnion(l: *L, node: Ast.Node.Index, zty: ZType) Error!TypedV
 }
 fn lowerExpr(l: *L, node: Ast.Node.Index, expected: ?ZType) Error!TypedValue {
     const tree = l.r.tree;
+    if (l.r.modules) |modules| modules.mark(tree, node);
     if (try importedIntegerConstant(l, node, expected)) |constant| return constant;
     if (expected != null and tree.nodeTag(node) == .@"orelse") return lowerOrelse(l, node, expected);
     if (tree.nodeTag(node) == .@"catch") return lowerCatchExpr(l, node, expected);
@@ -3622,6 +4028,7 @@ fn lowerPointerArrayFor(l: *L, ff: Ast.full.For) Error!bool {
 
 fn lowerStmt(l: *L, stmt: Ast.Node.Index) Error!bool {
     const tree = l.r.tree;
+    if (l.r.modules) |modules| modules.mark(tree, stmt);
     if (l.is_naked and tree.nodeTag(stmt) != .asm_simple) return Error.UnsupportedNode;
     switch (tree.nodeTag(stmt)) {
         .block, .block_semicolon, .block_two, .block_two_semicolon => return lowerBlock(l, stmt),
@@ -4054,12 +4461,11 @@ fn lowerStmt(l: *L, stmt: Ast.Node.Index) Error!bool {
             const call = tree.fullCall(&call_buf, stmt) orelse return false;
             if (tree.nodeTag(call.ast.fn_expr) == .identifier) {
                 const name = tree.tokenSlice(tree.nodeMainToken(call.ast.fn_expr));
-                if (findFnSig(l.fn_sigs, name)) |sig| {
-                    if (sig.is_noreturn) {
-                        try l.func.setJump(l.block, l.block, l.func.blockParams(l.block));
-                        return true;
-                    }
-                }
+                const sig = try ensureLocalFnSig(l, name);
+                if (sig) |resolved_sig| if (resolved_sig.is_noreturn) {
+                    try l.func.setJump(l.block, l.block, l.func.blockParams(l.block));
+                    return true;
+                };
             }
             if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
                 if (try importedFnSig(l, call.ast.fn_expr)) |sig| if (sig.is_noreturn) {
@@ -4179,8 +4585,116 @@ fn lowerFunction(gpa: std.mem.Allocator, ctx: *Ctx, proto_node: Ast.Node.Index, 
     return func;
 }
 
-fn lowerRoot(gpa: std.mem.Allocator, arena: std.mem.Allocator, tree: *const Ast, target: TargetArch, dir: []const u8, modules: ?*Modules) Error!Module {
-    var ctx: Ctx = .{ .tree = tree, .dir = dir, .arena = arena, .target = target, .modules = modules };
+/// A `test` body has no parameters and no return value. Failure in this subset is a
+/// runtime trap (or an unsupported construct), not an error value.
+fn lowerTestFunction(gpa: std.mem.Allocator, ctx: *Ctx, body: Ast.Node.Index, fn_sigs: []const FnSig) Error!Function {
+    var func = Function.init(gpa);
+    errdefer func.deinit();
+    const entry = try func.appendBlock();
+    var l: L = .{
+        .r = ctx,
+        .func = &func,
+        .block = entry,
+        .ret_zty = null,
+        .env = .empty,
+        .fn_sigs = fn_sigs,
+    };
+    defer l.env.deinit(gpa);
+    defer l.deferred_va_ends.deinit(gpa);
+    const terminated = try lowerBlock(&l, body);
+    if (!terminated) {
+        try emitDeferredVaEnds(&l);
+        func.setTerminator(l.block, .{ .ret = ir.function.Ret.none() });
+    }
+    return func;
+}
+
+/// Lower every `test` declaration in the root module's files. `ModuleMapping` module
+/// boundaries and `std` belong to other compilations, so their tests are not included.
+fn lowerTests(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    compiler: *Compiler,
+    root_ctx: *Ctx,
+    root_tree: *const Ast,
+    root_sigs: []const FnSig,
+    filters: []const []const u8,
+    funcs: *std.ArrayList(NamedFunction),
+    tests: *std.ArrayList(Test),
+) Error!void {
+    const modules = root_ctx.modules;
+    var test_index: usize = 0;
+    var file_index: usize = 0;
+    while (true) : (file_index += 1) {
+        const tree: *const Ast = if (file_index == 0) root_tree else blk: {
+            const module_files = if (modules) |m| m.files.items else break;
+            const i = file_index - 1;
+            if (i >= module_files.len) break;
+            const file = module_files[i].file;
+            const root_module_index = modules.?.root.?.module_index;
+            if (file.is_std or file.module_index != root_module_index) continue;
+            break :blk file.tree;
+        };
+        const ctx = if (tree == root_tree) root_ctx else try compiler.contextFor(tree);
+        const sigs: []const FnSig = if (tree == root_tree) root_sigs else &.{};
+        const loaded = if (modules) |m| m.owner(tree) else null;
+        for (tree.rootDecls()) |decl| {
+            if (tree.nodeTag(decl) != .test_decl) continue;
+            const data = tree.nodeData(decl).opt_token_and_node;
+            const body = data[1];
+            const display = if (data[0].unwrap()) |name_token| blk: {
+                if (tree.tokenTag(name_token) == .string_literal)
+                    break :blk std.zig.string_literal.parseAlloc(arena, tree.tokenSlice(name_token)) catch return Error.UnsupportedNode;
+                break :blk try arena.dupe(u8, tree.tokenSlice(name_token));
+            } else blk: {
+                const location = tree.tokenLocation(0, tree.nodeMainToken(decl));
+                const file_name = if (loaded) |file| std.fs.path.basename(file.path) else "<source>";
+                break :blk try std.fmt.allocPrint(arena, "{s}:{d}", .{ file_name, location.line + 1 });
+            };
+            if (filters.len != 0) {
+                var matched = false;
+                for (filters) |filter| {
+                    if (std.mem.find(u8, display, filter) != null) {
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) continue;
+            }
+            const link_name = try std.fmt.allocPrint(arena, "__vulcan_test_{d}", .{test_index});
+            test_index += 1;
+            var func = try lowerTestFunction(gpa, ctx, body, sigs);
+            errdefer func.deinit();
+            const owned_link = try gpa.dupe(u8, link_name);
+            errdefer gpa.free(owned_link);
+            try funcs.append(arena, .{ .name = owned_link, .func = func });
+            const owned_name = try gpa.dupe(u8, display);
+            errdefer gpa.free(owned_name);
+            const owned_link_copy = try gpa.dupe(u8, link_name);
+            errdefer gpa.free(owned_link_copy);
+            try tests.append(arena, .{ .name = owned_name, .link_name = owned_link_copy });
+        }
+    }
+}
+
+fn lowerRoot(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    tree: *const Ast,
+    target: TargetArch,
+    dir: []const u8,
+    modules: ?*Modules,
+    include_tests: bool,
+    test_filters: []const []const u8,
+) Error!Module {
+    var ctx: Ctx = undefined;
+    var compiler = Compiler{ .gpa = gpa, .arena = arena, .target = target, .modules = modules, .root_ctx = &ctx };
+    ctx = .{ .tree = tree, .dir = dir, .arena = arena, .target = target, .modules = modules, .compiler = &compiler, .is_root = true };
+    try compiler.contexts.append(arena, &ctx);
+    errdefer for (compiler.data.items) |d| {
+        gpa.free(d.name);
+        gpa.free(d.bytes);
+    };
     var names: std.StringHashMapUnmanaged(void) = .empty;
     var imports: std.StringHashMapUnmanaged(void) = .empty;
 
@@ -4220,6 +4734,7 @@ fn lowerRoot(gpa: std.mem.Allocator, arena: std.mem.Allocator, tree: *const Ast,
     }
 
     for (tree.rootDecls()) |decl| {
+        if (modules) |module_graph| module_graph.mark(tree, decl);
         switch (tree.nodeTag(decl)) {
             .fn_decl => {
                 const dd = tree.nodeData(decl).node_and_node;
@@ -4230,6 +4745,7 @@ fn lowerRoot(gpa: std.mem.Allocator, arena: std.mem.Allocator, tree: *const Ast,
                 if (names.contains(name)) return Error.DuplicateDecl;
                 try names.put(arena, name, {});
                 try fn_nodes.append(arena, .{ .name = name, .proto_node = dd[0], .body = dd[1] });
+                try ctx.function_decls.put(arena, name, .{ .decl_node = decl, .proto_node = dd[0], .body_node = dd[1] });
             },
             .simple_var_decl, .local_var_decl, .aligned_var_decl, .global_var_decl => {
                 const vd = tree.fullVarDecl(decl) orelse return Error.UnsupportedNode;
@@ -4295,7 +4811,7 @@ fn lowerRoot(gpa: std.mem.Allocator, arena: std.mem.Allocator, tree: *const Ast,
                     if (utf16LiteralArg(tree, init_node)) |string_node| {
                         const encoded = try encodeUtf16LiteralGlobal(gpa, arena, tree, string_node);
                         errdefer gpa.free(encoded.bytes);
-                        try ctx.globals.put(arena, name, .{ .zty = encoded.zty });
+                        try ctx.globals.put(arena, name, .{ .zty = encoded.zty, .symbol = name });
                         const owned_name = try gpa.dupe(u8, name);
                         errdefer gpa.free(owned_name);
                         const is_const_decl = tree.tokenTag(vd.ast.mut_token) == .keyword_const;
@@ -4323,7 +4839,15 @@ fn lowerRoot(gpa: std.mem.Allocator, arena: std.mem.Allocator, tree: *const Ast,
                 });
             },
             .test_decl => {},
-            else => return Error.UnsupportedNode,
+            else => {
+                var proto_buf: [1]Ast.Node.Index = undefined;
+                const proto = tree.fullFnProto(&proto_buf, decl) orelse return Error.UnsupportedNode;
+                const token = proto.name_token orelse return Error.UnsupportedNode;
+                const name = tree.tokenSlice(token);
+                if (names.contains(name)) return Error.DuplicateDecl;
+                try names.put(arena, name, {});
+                try ctx.function_decls.put(arena, name, .{ .decl_node = decl, .proto_node = decl, .body_node = null });
+            },
         }
     }
 
@@ -4335,7 +4859,7 @@ fn lowerRoot(gpa: std.mem.Allocator, arena: std.mem.Allocator, tree: *const Ast,
     // complete data table reaches the linker.
     for (global_nodes.items) |global| {
         const zty = global.zty orelse try resolveType(&ctx, global.type_node.?);
-        try ctx.globals.put(arena, global.name, .{ .zty = zty });
+        try ctx.globals.put(arena, global.name, .{ .zty = zty, .symbol = global.name });
     }
     var defined_global_count: usize = 0;
     for (global_nodes.items) |global| if (!global.is_extern) {
@@ -4353,7 +4877,7 @@ fn lowerRoot(gpa: std.mem.Allocator, arena: std.mem.Allocator, tree: *const Ast,
     for (global_nodes.items) |global| {
         if (global.is_extern) continue;
         const def = ctx.globals.get(global.name).?;
-        data[data_built] = try lowerGlobalData(gpa, tree, global.name, def.zty, global.is_const, global.init_node.?, global.constant);
+        data[data_built] = try lowerGlobalData(gpa, tree, global.name, def.zty, global.is_const, global.init_node.?, global.constant orelse evalTopConst(&ctx, global.init_node.?));
         data_built += 1;
     }
     for (inferred_data.items) |d| {
@@ -4367,67 +4891,71 @@ fn lowerRoot(gpa: std.mem.Allocator, arena: std.mem.Allocator, tree: *const Ast,
 
     var fn_sigs: std.ArrayList(FnSig) = .empty;
     for (fn_nodes.items) |fd| {
-        var buf1: [1]Ast.Node.Index = undefined;
-        const fn_proto = tree.fullFnProto(&buf1, fd.proto_node).?;
-        var params: std.ArrayList(ZType) = .empty;
-        var is_variadic = false;
-        var pit = fn_proto.iterate(tree);
-        while (pit.next()) |p| {
-            if (p.anytype_ellipsis3) |tok| {
-                // param, still unsupported): both fill the same `Param` field, told apart by
-                // the token itself. Only the fixed params before it join `params`; a call
-                // site can still target this function with exactly those (no variadic-call
-                // support here, only variadic-definition support - see this file's header).
-                if (tree.tokenTag(tok) != .ellipsis3) return Error.UnsupportedType;
-                is_variadic = true;
-                break;
-            }
-            const te = p.type_expr orelse return Error.UnsupportedType;
-            const pz = try resolveType(&ctx, te);
-            if ((pz.isAggregate() and pz != .optional_value and pz != .slice) or pz.optionalPayloadIsAggregate()) return Error.UnsupportedType;
-            try params.append(arena, pz);
-        }
-        const ret_node = fn_proto.ast.return_type.unwrap() orelse return Error.UnsupportedNode;
-        const is_noreturn = isNoReturnType(tree, ret_node);
-        const ret: ?ZType = try resolveFnReturnType(&ctx, tree, ctx.dir, ret_node);
-        if (ret) |rz| {
-            if ((rz.isAggregate() and rz != .optional_value and rz != .slice and rz != .error_union) or (rz.optionalPayloadIsAggregate() and (target != .aarch64 or rz.byteSize() <= 16))) return Error.UnsupportedType;
-            if (rz == .error_union and rz.byteSize() > 16 and target != .aarch64) return Error.UnsupportedType;
-        }
-        try fn_sigs.append(arena, .{
-            .name = fd.name,
-            .params = try params.toOwnedSlice(arena),
-            .ret = ret,
-            .is_variadic = is_variadic,
-            .is_noreturn = is_noreturn,
-        });
+        try fn_sigs.append(arena, (try ensureFunction(&ctx, fd.name)).?);
     }
 
-    const funcs = try gpa.alloc(NamedFunction, fn_nodes.items.len);
-    var built: usize = 0;
+    var funcs: std.ArrayList(NamedFunction) = .empty;
     errdefer {
-        for (funcs[0..built]) |*nf| {
+        for (funcs.items) |*nf| {
             nf.func.deinit();
             gpa.free(nf.name);
         }
-        gpa.free(funcs);
     }
-    for (fn_nodes.items, 0..) |fd, i| {
-        const func = try lowerFunction(gpa, &ctx, fd.proto_node, fd.body, fn_sigs.items);
-        funcs[i] = .{ .name = try gpa.dupe(u8, fd.name), .func = func };
-        built += 1;
+    for (fn_nodes.items) |fd| {
+        var func = try lowerFunction(gpa, &ctx, fd.proto_node, fd.body, fn_sigs.items);
+        errdefer func.deinit();
+        const name = try gpa.dupe(u8, fd.name);
+        errdefer gpa.free(name);
+        try funcs.append(arena, .{ .name = name, .func = func });
     }
-    if (ctx.literal_data.items.len != 0) {
-        data = try gpa.realloc(data, data_built + ctx.literal_data.items.len);
-        for (ctx.literal_data.items) |literal| {
-            const name = try gpa.dupe(u8, literal.name);
-            const bytes = gpa.dupe(u8, literal.bytes) catch |err| {
-                gpa.free(name);
-                return err;
-            };
-            data[data_built] = .{ .name = name, .bytes = bytes, .kind = literal.kind, .size = literal.size };
-            data_built += 1;
+    var tests: std.ArrayList(Test) = .empty;
+    errdefer for (tests.items) |test_entry| {
+        gpa.free(test_entry.name);
+        gpa.free(test_entry.link_name);
+    };
+    if (include_tests) try lowerTests(gpa, arena, &compiler, &ctx, tree, fn_sigs.items, test_filters, &funcs, &tests);
+    // Signatures publish their symbols before a body enters this queue. A reached
+    // declaration can therefore recurse, or be reached through a diamond, only once.
+    var next_function: usize = 0;
+    while (next_function < compiler.function_queue.items.len) : (next_function += 1) {
+        const key = compiler.function_queue.items[next_function];
+        const entry = compiler.functions.get(key).?;
+        var func = try lowerFunction(gpa, entry.ctx, entry.info.proto_node, entry.info.body_node.?, &.{});
+        errdefer func.deinit();
+        func.is_local = entry.is_local;
+        const name = try gpa.dupe(u8, entry.symbol);
+        errdefer gpa.free(name);
+        try funcs.append(arena, .{ .name = name, .func = func });
+    }
+    var literal_count: usize = 0;
+    for (compiler.contexts.items) |file_ctx| literal_count += file_ctx.literal_data.items.len;
+    data = try gpa.realloc(data, data_built + compiler.data.items.len + literal_count);
+    for (compiler.data.items) |d| {
+        data[data_built] = d;
+        data_built += 1;
+    }
+    compiler.data.items.len = 0;
+    for (compiler.contexts.items) |file_ctx| for (file_ctx.literal_data.items) |literal| {
+        const name = try gpa.dupe(u8, literal.name);
+        const bytes = gpa.dupe(u8, literal.bytes) catch |err| {
+            gpa.free(name);
+            return err;
+        };
+        data[data_built] = .{ .name = name, .bytes = bytes, .kind = literal.kind, .size = literal.size };
+        data_built += 1;
+    };
+    const imports_result = try collectImports(gpa, tree);
+    errdefer {
+        for (imports_result) |import| {
+            gpa.free(import.name);
+            gpa.free(import.path);
         }
+        gpa.free(imports_result);
     }
-    return Module{ .funcs = funcs, .data = data, .imports = try collectImports(gpa, tree) };
+    return Module{
+        .funcs = try gpa.dupe(NamedFunction, funcs.items),
+        .data = data,
+        .imports = imports_result,
+        .tests = try gpa.dupe(Test, tests.items),
+    };
 }
